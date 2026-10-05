@@ -1,0 +1,38 @@
+name: Bug report
+description: Something in MarioCraft doesn't work (installing, or in the game)
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where did it go wrong?
+      options:
+        - Installing (install.bat)
+        - Starting the game (MarioCraft Launcher)
+        - In the game
+        - Multiplayer
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead. For something in a level, say which level and star.
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: The installer's message
+      description: If install.bat stopped, paste everything from the "PROBLEM:" line up. If a build failed, attach sm64coopdx-build.log or minecraft-mod-build.log from the MarioCraft folder.
+      render: text
+  - type: textarea
+    id: status
+    attributes:
+      label: Screenshot
+      description: For a bug in the game, a screenshot helps a lot, ideally with the debug status line showing (press F7 in the game).
+  - type: input
+    id: version
+    attributes:
+      label: MarioCraft version
+      placeholder: "1.0"

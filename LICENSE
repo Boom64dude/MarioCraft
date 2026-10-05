@@ -1,0 +1,38 @@
+MIT License
+
+Copyright (c) 2026 the MarioCraft contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+What this license covers
+
+This license covers MarioCraft's own work:
+
+  - the installer, launcher and Prism setup (install.bat, install.sh, launcher/)
+  - the files MarioCraft adds to sm64coopdx (src/pc/mariocraft/, and
+    src/pc/network/packets/packet_mariocraft.c, in patches/sm64coopdx.patch)
+  - MarioCraft's changes to SkyCraft (patches/skycraft.patch). SkyCraft itself
+    is also MIT licensed: see licenses/SkyCraft-LICENSE.txt.
+
+It does not cover sm64coopdx. sm64coopdx doesn't publish a license, so its code
+(including the parts of its existing files that patches/sm64coopdx.patch changes
+or shows as context) stays under its authors' terms. MarioCraft doesn't include
+sm64coopdx: the installer downloads it from its own repository. See
+THIRD-PARTY-NOTICES.md.

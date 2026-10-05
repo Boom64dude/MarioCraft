@@ -1,0 +1,3598 @@
+diff --git a/fabric/build.gradle b/fabric/build.gradle
+index 5a2df2f..4a73cfd 100644
+--- a/fabric/build.gradle
++++ b/fabric/build.gradle
+@@ -23,7 +23,7 @@ loom {
+ 
+ 	runs {
+ 		client {
+-			programArgs "--username", (System.getenv("SKYCRAFT_USERNAME") ?: "Dovahkiin")
++			programArgs "--username", (System.getenv("SKYCRAFT_USERNAME") ?: "Mario")
+ 			vmArgs "--enable-native-access=ALL-UNNAMED", "-Dskycraft.quitWithSkyrim=false"
+ 		}
+ 	}
+diff --git a/fabric/src/client/java/dev/skycraft/client/DiscordPresence.java b/fabric/src/client/java/dev/skycraft/client/DiscordPresence.java
+index f90b2c7..a03403c 100644
+--- a/fabric/src/client/java/dev/skycraft/client/DiscordPresence.java
++++ b/fabric/src/client/java/dev/skycraft/client/DiscordPresence.java
+@@ -51,6 +51,11 @@ public final class DiscordPresence {
+ 		thread.start();
+ 	}
+ 
++	/** Our world's e4mc link while it's open to LAN, or null (MarioLobby passes it to SM64). */
++	public static @Nullable String currentHostLink() {
++		return hostLink;
++	}
++
+ 	/** Every chat line (ChatComponentMixin): e4mc's "Local game hosted on domain [...]" gives the link. */
+ 	public static void onChat(Component message) {
+ 		String link = findLink(message);
+diff --git a/fabric/src/client/java/dev/skycraft/client/GuestActorsClient.java b/fabric/src/client/java/dev/skycraft/client/GuestActorsClient.java
+new file mode 100644
+index 0000000..69a3568
+--- /dev/null
++++ b/fabric/src/client/java/dev/skycraft/client/GuestActorsClient.java
+@@ -0,0 +1,62 @@
++package dev.skycraft.client;
++
++import dev.skycraft.link.Proto;
++import dev.skycraft.link.SkyLink;
++import dev.skycraft.net.SkyNet;
++import java.util.ArrayList;
++import java.util.List;
++import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
++import net.minecraft.client.Minecraft;
++
++/**
++ * MarioCraft multiplayer, a guest's side of fighting: their own SM64's enemies (the actor table it
++ * writes, in whatever level they're in) go to the host's server every other tick, which makes
++ * stand-ins for them (SkyCombat); hits on those, and explosions, come back here and go to SM64 as
++ * if the hit had happened on this machine.
++ */
++public final class GuestActorsClient {
++	private static final double RANGE = 32.0;
++	private static final List<SkyLink.Actor> ACTORS = new ArrayList<>();
++	private static int ticks;
++	private static boolean sentAny;
++
++	private GuestActorsClient() {
++	}
++
++	public static void register() {
++		ClientPlayNetworking.registerGlobalReceiver(SkyNet.HitActor.TYPE, (payload, context) -> {
++			if (SkyLink.active()) {
++				SkyLink.pushEvent(Proto.EV_HIT_ACTOR, payload.formId(), payload.damage(), payload.pushX(), payload.pushZ(), payload.push(), payload.flags(),
++					payload.weapon());
++			}
++		});
++		ClientPlayNetworking.registerGlobalReceiver(SkyNet.Explosion.TYPE, (payload, context) -> {
++			if (SkyLink.active()) {
++				SkyLink.pushEvent(Proto.EV_EXPLOSION, 0, payload.x(), payload.y(), payload.z(), payload.radius(), 0);
++			}
++		});
++	}
++
++	/** Every client tick. */
++	public static void tick(Minecraft minecraft) {
++		if (++ticks % 2 != 0 || minecraft.player == null || minecraft.getSingleplayerServer() != null || !SkyLink.active()
++			|| !ClientPlayNetworking.canSend(SkyNet.GuestActors.TYPE) || !SkyLink.readActors(ACTORS)) {
++			return;
++		}
++		List<SkyNet.GuestActor> near = new ArrayList<>();
++		for (SkyLink.Actor a : ACTORS) {
++			if (a.dead() || minecraft.player.distanceToSqr(a.x(), a.y(), a.z()) > RANGE * RANGE) {
++				continue;
++			}
++			near.add(new SkyNet.GuestActor(a.formId(), a.flags(), a.x(), a.y(), a.z(), a.yaw(), a.width(), a.height(), a.name()));
++			if (near.size() == 64) {
++				break;
++			}
++		}
++		if (near.isEmpty() && !sentAny) {
++			return;
++		}
++		sentAny = !near.isEmpty();
++		ClientPlayNetworking.send(new SkyNet.GuestActors(near));
++	}
++}
+diff --git a/fabric/src/client/java/dev/skycraft/client/GuestShapeClient.java b/fabric/src/client/java/dev/skycraft/client/GuestShapeClient.java
+new file mode 100644
+index 0000000..7ae2084
+--- /dev/null
++++ b/fabric/src/client/java/dev/skycraft/client/GuestShapeClient.java
+@@ -0,0 +1,67 @@
++package dev.skycraft.client;
++
++import dev.skycraft.link.SkyLink;
++import dev.skycraft.net.SkyNet;
++import dev.skycraft.world.SkyCollision;
++import java.util.Arrays;
++import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
++import net.minecraft.client.Minecraft;
++
++/**
++ * MarioCraft multiplayer, a guest's level shape for the host's server: the server only has the
++ * host's SM64 level, so near a guest in another level items and mobs fell through the ground.
++ * Every collision message the guest's SM64 sends goes up too (SkyNet.GuestShape), a few per tick,
++ * and all of them again on joining.
++ */
++public final class GuestShapeClient {
++	/** At most this much a tick (about 1 MB a second, only while a level is loading): it goes over the internet. */
++	private static final int BYTES_PER_TICK = 48 * 1024;
++	private static final int PER_TICK = 40;
++	private static boolean wasGuest;
++	private static int msgId;
++	private static byte[] sending;
++	private static int sendingPart;
++
++	private GuestShapeClient() {
++	}
++
++	/** Every client tick. */
++	public static void tick(Minecraft minecraft) {
++		boolean guest = minecraft.player != null && minecraft.getSingleplayerServer() == null && SkyLink.active()
++			&& ClientPlayNetworking.canSend(SkyNet.GuestShape.TYPE);
++		SkyCollision.uploading = guest;
++		if (guest && !wasGuest) {
++			SkyCollision.requeueAllForUpload();
++			sending = null;
++		}
++		wasGuest = guest;
++		if (!guest) {
++			sending = null;
++			return;
++		}
++		int sent = 0;
++		for (int n = 0; n < PER_TICK && sent < BYTES_PER_TICK; n++) {
++			if (sending == null) {
++				sending = SkyCollision.pollUpload();
++				sendingPart = 0;
++				msgId++;
++				if (sending == null) {
++					return;
++				}
++			}
++			int size = SkyNet.GuestShape.PART_BYTES;
++			int total = (sending.length + size - 1) / size;
++			if (total > 256) {
++				sending = null;  // (bigger than any region SM64 sends)
++				continue;
++			}
++			int from = sendingPart * size;
++			byte[] part = Arrays.copyOfRange(sending, from, Math.min(sending.length, from + size));
++			ClientPlayNetworking.send(new SkyNet.GuestShape(msgId, sendingPart, total, part));
++			sent += part.length;
++			if (++sendingPart == total) {
++				sending = null;
++			}
++		}
++	}
++}
+diff --git a/fabric/src/client/java/dev/skycraft/client/InputBridge.java b/fabric/src/client/java/dev/skycraft/client/InputBridge.java
+index 929e5c4..acc67ee 100644
+--- a/fabric/src/client/java/dev/skycraft/client/InputBridge.java
++++ b/fabric/src/client/java/dev/skycraft/client/InputBridge.java
+@@ -62,7 +62,36 @@ public final class InputBridge {
+ 				}
+ 			}
+ 			case Proto.IN_RELEASE_ALL -> releaseAll();
+-			case Proto.IN_HURT -> hurt(minecraft, code, a / 100.0F, b, c);
++			case Proto.IN_HURT_CAUSE -> {
++				if (code == 0) {
++					java.util.Arrays.fill(CAUSE, (byte) 0);
++				}
++				if (code >= 0 && code < 4) {
++					java.nio.ByteBuffer.wrap(CAUSE, code * 12, 12).order(java.nio.ByteOrder.LITTLE_ENDIAN).putInt(a).putInt(b).putInt(c);
++				}
++			}
++			case Proto.IN_HURT -> {
++				int n = 0;
++				while (n < CAUSE.length && CAUSE[n] != 0) {
++					n++;
++				}
++				String cause = new String(CAUSE, 0, n, java.nio.charset.StandardCharsets.UTF_8);
++				java.util.Arrays.fill(CAUSE, (byte) 0);
++				hurt(minecraft, code, a / 100.0F, b, c, cause);
++			}
++			case Proto.IN_HEAL -> heal(minecraft, a / 100.0F);
++			case Proto.IN_SOUND -> MarioSounds.play(minecraft, code);
++			case Proto.IN_VELOCITY -> {
++				if (minecraft.player != null) {
++					// code: bit 0, only the upward speed (b) is set and the player keeps their own
++					// sideways speed; bits 4 and up, one of Mario's jumps: its extra height in tenths
++					// of a block (it doesn't count towards fall damage).
++					var now = minecraft.player.getDeltaMovement();
++					boolean keepSideways = (code & 1) != 0;
++					minecraft.player.setDeltaMovement(keepSideways ? now.x : a / 10000.0, b / 10000.0, keepSideways ? now.z : c / 10000.0);
++					marioJump(minecraft, (code >> 4) / 10.0F);
++				}
++			}
+ 			case Proto.IN_OPEN_MENU -> {
+ 				if (minecraft.gui.screen() == null && minecraft.player != null) {
+ 					releaseAll();
+@@ -74,8 +103,74 @@ public final class InputBridge {
+ 		}
+ 	}
+ 
++	/** MarioCraft: SM64 healed the player (a heart, coins): on the integrated server, or the host's. */
++	private static void heal(Minecraft minecraft, float amount) {
++		var server = minecraft.getSingleplayerServer();
++		if (minecraft.player == null || amount <= 0.0F) {
++			return;
++		}
++		if (server == null) {
++			if (net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.canSend(dev.skycraft.net.SkyNet.Heal.TYPE)) {
++				net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.send(new dev.skycraft.net.SkyNet.Heal(amount));
++			}
++			return;
++		}
++		var uuid = minecraft.player.getUUID();
++		server.execute(() -> {
++			ServerPlayer player = server.getPlayerList().getPlayer(uuid);
++			if (player != null) {
++				dev.skycraft.world.MarioFalls.marioHeal(player, amount);
++			}
++		});
++	}
++
++	/** MarioCraft: SM64 just put the player somewhere or let go of them: their next landing is safe (MarioFalls). */
++	public static void safeLanding(Minecraft minecraft) {
++		var server = minecraft.getSingleplayerServer();
++		if (minecraft.player == null) {
++			return;
++		}
++		minecraft.player.resetFallDistance();
++		if (server == null) {
++			if (net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.canSend(dev.skycraft.net.SkyNet.SafeLanding.TYPE)) {
++				net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.send(new dev.skycraft.net.SkyNet.SafeLanding(0));
++			}
++			return;
++		}
++		var uuid = minecraft.player.getUUID();
++		server.execute(() -> {
++			ServerPlayer player = server.getPlayerList().getPlayer(uuid);
++			if (player != null) {
++				dev.skycraft.world.MarioFalls.markSafe(player);
++			}
++		});
++	}
++
++	/** MarioCraft: one of Mario's jumps took the player this much higher (MarioFalls.markJump). */
++	private static void marioJump(Minecraft minecraft, float blocks) {
++		var server = minecraft.getSingleplayerServer();
++		if (minecraft.player == null || blocks <= 0.0F) {
++			return;
++		}
++		if (server == null) {
++			if (net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.canSend(dev.skycraft.net.SkyNet.SafeLanding.TYPE)) {
++				net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.send(new dev.skycraft.net.SkyNet.SafeLanding(Math.round(blocks * 100.0F)));
++			}
++			return;
++		}
++		var uuid = minecraft.player.getUUID();
++		server.execute(() -> {
++			ServerPlayer player = server.getPlayerList().getPlayer(uuid);
++			if (player != null) {
++				dev.skycraft.world.MarioFalls.markJump(player, blocks);
++			}
++		});
++	}
++
+ 	/** Skyrim hit the player: apply it as Minecraft damage on the integrated server (or the host's). */
+-	private static void hurt(Minecraft minecraft, int kind, float skyrimDamage, int attacker, int flags) {
++	private static final byte[] CAUSE = new byte[48];  // IN_HURT_CAUSE's text, for the next IN_HURT
++
++	private static void hurt(Minecraft minecraft, int kind, float skyrimDamage, int attacker, int flags, String cause) {
+ 		var server = minecraft.getSingleplayerServer();
+ 		if (minecraft.player == null) {
+ 			return;
+@@ -83,7 +178,7 @@ public final class InputBridge {
+ 		if (server == null) {
+ 			// A guest in a friend's world: the host's server applies it.
+ 			if (net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.canSend(dev.skycraft.net.SkyNet.Hurt.TYPE)) {
+-				net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.send(new dev.skycraft.net.SkyNet.Hurt(kind, skyrimDamage, attacker, flags));
++				net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.send(new dev.skycraft.net.SkyNet.Hurt(kind, skyrimDamage, attacker, flags, cause));
+ 			}
+ 			return;
+ 		}
+@@ -91,7 +186,7 @@ public final class InputBridge {
+ 		server.execute(() -> {
+ 			ServerPlayer player = server.getPlayerList().getPlayer(uuid);
+ 			if (player != null) {
+-				SkyCombat.hurtPlayer(player, kind, skyrimDamage, attacker, flags);
++				SkyCombat.hurtPlayer(player, kind, skyrimDamage, attacker, flags, cause);
+ 			}
+ 		});
+ 	}
+diff --git a/fabric/src/client/java/dev/skycraft/client/MarioCaps.java b/fabric/src/client/java/dev/skycraft/client/MarioCaps.java
+new file mode 100644
+index 0000000..f73f6ee
+--- /dev/null
++++ b/fabric/src/client/java/dev/skycraft/client/MarioCaps.java
+@@ -0,0 +1,46 @@
++package dev.skycraft.client;
++
++import dev.skycraft.link.Proto;
++import dev.skycraft.link.SkyLink;
++import net.minecraft.client.Minecraft;
++import net.minecraft.server.level.ServerPlayer;
++
++/**
++ * MarioCraft: Mario's power-ups give Steve Minecraft effects while they last (SM64 runs the cap
++ * timer; SkyState says which cap is on). Refreshed every second for two, so they end with the cap.
++ * The wing cap's flight itself is SkyClient.wingCap.
++ */
++public final class MarioCaps {
++	private static final SkyLink.SkyState SKY = new SkyLink.SkyState();
++	private static int ticks;
++
++	private MarioCaps() {
++	}
++
++	public static void tick(Minecraft minecraft) {
++		if (++ticks % 10 != 0 || minecraft.player == null || !SkyLink.readSkyState(SKY) || !SKY.inGame()) {
++			return;
++		}
++		// An underwater level (Jolly Roger Bay, Dire, Dire Docks...): Steve breathes underwater
++		// while he's in its water, as Mario only runs out of air slowly there.
++		boolean breathe = (SKY.flags & Proto.SKY_WATER_LEVEL) != 0 && (minecraft.player.isInWater() || minecraft.player.isUnderWater());
++		int mask = (SKY.flags & (Proto.SKY_WING_CAP | Proto.SKY_METAL_CAP | Proto.SKY_VANISH_CAP)) | (breathe ? Proto.SKY_WATER_LEVEL : 0);
++		if (mask == 0) {
++			return;
++		}
++		var server = minecraft.getSingleplayerServer();
++		if (server == null) {
++			if (net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.canSend(dev.skycraft.net.SkyNet.Caps.TYPE)) {
++				net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.send(new dev.skycraft.net.SkyNet.Caps(mask));
++			}
++			return;
++		}
++		var uuid = minecraft.player.getUUID();
++		server.execute(() -> {
++			ServerPlayer player = server.getPlayerList().getPlayer(uuid);
++			if (player != null) {
++				dev.skycraft.world.MarioFalls.capEffects(player, mask);
++			}
++		});
++	}
++}
+diff --git a/fabric/src/client/java/dev/skycraft/client/MarioLobby.java b/fabric/src/client/java/dev/skycraft/client/MarioLobby.java
+new file mode 100644
+index 0000000..f0fc7b4
+--- /dev/null
++++ b/fabric/src/client/java/dev/skycraft/client/MarioLobby.java
+@@ -0,0 +1,217 @@
++package dev.skycraft.client;
++
++import static java.lang.foreign.ValueLayout.JAVA_BYTE;
++import static java.lang.foreign.ValueLayout.JAVA_INT;
++
++import dev.skycraft.SkyCraft;
++import dev.skycraft.link.Proto;
++import dev.skycraft.link.SkyLink;
++import java.lang.foreign.MemorySegment;
++import java.lang.invoke.VarHandle;
++import java.nio.charset.StandardCharsets;
++import net.minecraft.client.Minecraft;
++import net.minecraft.network.chat.Component;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * MarioCraft multiplayer: everyone's Minecraft in one world while they play SM64 together.
++ *
++ * <p>SM64 (src/pc/mariocraft/mc_lobby.c) writes what this Minecraft should do into the lobby block
++ * at {@link Proto#OFF_LOBBY}: host (open this world to LAN, which e4mc puts on the internet), join
++ * the host's address, or be back in its own world. This answers with what it's doing (own world,
++ * hosting at a link, or in a friend's world) and how many players are in it. SM64 passes the host's
++ * link to everyone over its own network, so nobody types anything.
++ *
++ * <p>Only worlds the lobby joined are left again: a /join typed by the player stays theirs.
++ */
++public final class MarioLobby {
++	private static final VarHandle INT = JAVA_INT.varHandle();
++	private static final long RETRY_MS = 20_000; // between attempts to reach the same address
++	private static final int MAX_TRIES = 3;
++
++	private static int lastWantSeq = -1;
++	private static int want = Proto.LB_WANT_NOTHING;
++	private static String wantAddr = "";
++	private static @Nullable String lobbyJoined; // the address the lobby joined (and may leave again)
++	private static String triedAddr = "";
++	private static int tries;
++	private static long nextTry;
++	private static int stateSeq;
++
++	private MarioLobby() {
++	}
++
++	private static @Nullable MemorySegment segment() {
++		MemorySegment s = SkyLink.segment();
++		if (s == null || (s.get(JAVA_INT, Proto.H_FEATURES) & Proto.FEATURE_LOBBY) == 0) {
++			return null;
++		}
++		return s;
++	}
++
++	/** Every client tick (render thread). */
++	public static void tick(Minecraft minecraft) {
++		MemorySegment s = segment();
++		if (s == null) {
++			return;
++		}
++		readWant(s);
++		act(minecraft);
++		writeState(s, minecraft);
++		writeFace(s, minecraft);
++	}
++
++	private static int @org.jspecify.annotations.Nullable [] sentFace;
++	private static int faceSeq;
++	private static long nextFaceCheck;
++
++	/** The player's skin face for SM64's HUD head (mc_steve.c), whenever it changes. */
++	private static void writeFace(MemorySegment s, Minecraft minecraft) {
++		long now = System.currentTimeMillis();
++		if (now < nextFaceCheck) {
++			return;
++		}
++		nextFaceCheck = now + 2000;
++		int[] face = dev.skycraft.client.render.SkinFace.face(minecraft);
++		if (face == null || java.util.Arrays.equals(face, sentFace)) {
++			return;
++		}
++		sentFace = face;
++		long b = Proto.OFF_LOBBY;
++		faceSeq += 2;
++		INT.setRelease(s, b + Proto.LB_FACE_SEQ, faceSeq - 1);
++		for (int i = 0; i < face.length; i++) {
++			s.set(JAVA_INT, b + Proto.LB_FACE + i * 4L, face[i]);
++		}
++		INT.setRelease(s, b + Proto.LB_FACE_SEQ, faceSeq);
++	}
++
++	private static void readWant(MemorySegment s) {
++		long b = Proto.OFF_LOBBY;
++		for (int attempt = 0; attempt < 4; attempt++) {
++			int seq1 = (int) INT.getAcquire(s, b + Proto.LB_WANT_SEQ);
++			if (seq1 == lastWantSeq) {
++				return;
++			}
++			if ((seq1 & 1) != 0) {
++				continue;
++			}
++			int w = s.get(JAVA_INT, b + Proto.LB_WANT);
++			String addr = readText(s, b + Proto.LB_WANT_ADDR);
++			int seq2 = (int) INT.getAcquire(s, b + Proto.LB_WANT_SEQ);
++			if (seq1 == seq2) {
++				lastWantSeq = seq1;
++				if (w != want || !addr.equals(wantAddr)) {
++					SkyCraft.LOG.info("MarioCraft: lobby wants {} {}", w, addr);
++					tries = 0;
++					nextTry = 0;
++				}
++				want = w;
++				wantAddr = addr;
++				return;
++			}
++		}
++	}
++
++	private static void act(Minecraft minecraft) {
++		if (minecraft.level == null || minecraft.player == null || minecraft.gui.screen() != null && !(minecraft.gui.screen() instanceof net.minecraft.client.gui.screens.ChatScreen)) {
++			return; // between worlds (MirrorWorld is busy), or a screen is open
++		}
++		var server = minecraft.getSingleplayerServer();
++		String friend = MirrorWorld.friendAddress(minecraft);
++		switch (want) {
++			case Proto.LB_WANT_HOST -> {
++				if (server != null && !server.isPublished()) {
++					int port = net.minecraft.util.HttpUtil.getAvailablePort();
++					boolean ok = server.publishServer(net.minecraft.server.MinecraftServer.MultiplayerScope.LAN, false, port);
++					SkyCraft.LOG.info("MarioCraft: opened this world to the SM64 session's players (port {}, {})", port, ok ? "ok" : "FAILED");
++				} else if (server == null && friend != null && friend.equals(lobbyJoined)) {
++					leave(minecraft); // we host now: back to our own world first
++				}
++			}
++			case Proto.LB_WANT_JOIN -> {
++				if (wantAddr.isEmpty() || wantAddr.equals(friend)) {
++					tries = 0;
++					return;
++				}
++				long now = System.currentTimeMillis();
++				if (!wantAddr.equals(triedAddr)) {
++					triedAddr = wantAddr;
++					tries = 0;
++					nextTry = 0;
++				}
++				if (tries >= MAX_TRIES || now < nextTry) {
++					return;
++				}
++				tries++;
++				nextTry = now + RETRY_MS;
++				if (tries == MAX_TRIES) {
++					SkyCraft.LOG.info("MarioCraft: last try at joining {}", wantAddr);
++				}
++				minecraft.gui.hud.getChat().addClientSystemMessage(Component.literal("Joining the host's world..."));
++				lobbyJoined = wantAddr;
++				MirrorWorld.joinFriend(minecraft, wantAddr);
++			}
++			case Proto.LB_WANT_OWN_WORLD -> {
++				if (friend != null && friend.equals(lobbyJoined)) {
++					leave(minecraft);
++				}
++			}
++			default -> {
++			}
++		}
++	}
++
++	private static void leave(Minecraft minecraft) {
++		SkyCraft.LOG.info("MarioCraft: leaving the session's world {}", lobbyJoined);
++		lobbyJoined = null;
++		MirrorWorld.leaveFriend(minecraft);
++	}
++
++	private static void writeState(MemorySegment s, Minecraft minecraft) {
++		int world = Proto.LB_WORLD_NONE;
++		String link = "";
++		int players = 0;
++		if (minecraft.level != null && minecraft.player != null && minecraft.getConnection() != null) {
++			players = minecraft.getConnection().getOnlinePlayers().size();
++			var server = minecraft.getSingleplayerServer();
++			String friend = MirrorWorld.friendAddress(minecraft);
++			if (server != null) {
++				world = server.isPublished() ? Proto.LB_WORLD_HOSTING : Proto.LB_WORLD_OWN;
++				String hostLink = server.isPublished() ? DiscordPresence.currentHostLink() : null;
++				link = hostLink != null ? hostLink : "";
++			} else if (friend != null) {
++				world = Proto.LB_WORLD_FRIEND;
++				link = friend;
++			}
++		}
++		long b = Proto.OFF_LOBBY;
++		stateSeq += 2;
++		INT.setRelease(s, b + Proto.LB_STATE_SEQ, stateSeq - 1);
++		s.set(JAVA_INT, b + Proto.LB_STATE, world);
++		s.set(JAVA_INT, b + Proto.LB_PLAYERS, players);
++		writeText(s, b + Proto.LB_LINK, link);
++		INT.setRelease(s, b + Proto.LB_STATE_SEQ, stateSeq);
++	}
++
++	private static String readText(MemorySegment s, long at) {
++		byte[] bytes = new byte[Proto.LB_TEXT_BYTES];
++		int n = 0;
++		while (n < bytes.length - 1) {
++			byte c = s.get(JAVA_BYTE, at + n);
++			if (c == 0) {
++				break;
++			}
++			bytes[n++] = c;
++		}
++		return new String(bytes, 0, n, StandardCharsets.UTF_8).trim();
++	}
++
++	private static void writeText(MemorySegment s, long at, String text) {
++		byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
++		int n = Math.min(bytes.length, Proto.LB_TEXT_BYTES - 1);
++		for (int i = 0; i < Proto.LB_TEXT_BYTES; i++) {
++			s.set(JAVA_BYTE, at + i, i < n ? bytes[i] : 0);
++		}
++	}
++}
+diff --git a/fabric/src/client/java/dev/skycraft/client/MarioSounds.java b/fabric/src/client/java/dev/skycraft/client/MarioSounds.java
+new file mode 100644
+index 0000000..dfd1368
+--- /dev/null
++++ b/fabric/src/client/java/dev/skycraft/client/MarioSounds.java
+@@ -0,0 +1,199 @@
++package dev.skycraft.client;
++
++import static java.lang.foreign.ValueLayout.JAVA_BYTE;
++import static java.lang.foreign.ValueLayout.JAVA_INT;
++
++import dev.skycraft.link.Proto;
++import dev.skycraft.link.SkyLink;
++import dev.skycraft.world.SkyCollision;
++import dev.skycraft.world.SkyDig;
++import dev.skycraft.world.SkyTri;
++import java.lang.foreign.MemorySegment;
++import java.lang.invoke.VarHandle;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.List;
++import net.minecraft.client.Minecraft;
++import net.minecraft.client.resources.sounds.SimpleSoundInstance;
++import net.minecraft.client.resources.sounds.SoundInstance;
++import net.minecraft.core.registries.BuiltInRegistries;
++import net.minecraft.resources.Identifier;
++import net.minecraft.sounds.SoundEvent;
++import net.minecraft.sounds.SoundSource;
++import net.minecraft.util.RandomSource;
++import net.minecraft.world.phys.AABB;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * MarioCraft: Minecraft's sounds for SM64.
++ *
++ * <ul>
++ * <li>Music: C418's, picked by SM64 for each level and event (mc_music.c) and played here, looping,
++ * instead of SM64's own (which it mutes). Played on the jukebox volume (Music & Sounds options,
++ * "Jukebox/Note Blocks"), since SkyCraft keeps Minecraft's own music off.</li>
++ * <li>Footsteps on SM64's ground: Minecraft only steps on blocks; on SM64's level it was silent.
++ * The step sound is the block the ground is made of (grass, stone, snow, sand, planks...).</li>
++ * <li>Sounds for what SM64 does to Steve (IN_SOUND): a ground pound, lava, picking up and throwing,
++ * being squished.</li>
++ * </ul>
++ */
++public final class MarioSounds {
++	private static final VarHandle INT = JAVA_INT.varHandle();
++	private static int lastMusicSeq = -1;
++	private static String musicName = "";
++	private static @Nullable SoundInstance music;
++	private static double lastWalk, lastX, lastZ;
++	private static final List<SkyTri> TRIS = new ArrayList<>();
++
++	private MarioSounds() {
++	}
++
++	/** Every client tick. */
++	public static void tick(Minecraft minecraft) {
++		music(minecraft);
++		footsteps(minecraft);
++	}
++
++	// ---- music -------------------------------------------------------------------------------
++
++	private static void music(Minecraft minecraft) {
++		MemorySegment s = SkyLink.segment();
++		if (s == null || !SkyLink.active() || (s.get(JAVA_INT, Proto.H_FEATURES) & Proto.FEATURE_LOBBY) == 0) {
++			stopMusic(minecraft);
++			lastMusicSeq = -1;
++			return;
++		}
++		long b = Proto.OFF_LOBBY;
++		int seq1 = (int) INT.getAcquire(s, b + Proto.LB_MUSIC_SEQ);
++		if (seq1 != lastMusicSeq && (seq1 & 1) == 0) {
++			byte[] bytes = new byte[Proto.LB_MUSIC_BYTES];
++			int n = 0;
++			while (n < bytes.length - 1) {
++				byte c = s.get(JAVA_BYTE, b + Proto.LB_MUSIC + n);
++				if (c == 0) {
++					break;
++				}
++				bytes[n++] = c;
++			}
++			int seq2 = (int) INT.getAcquire(s, b + Proto.LB_MUSIC_SEQ);
++			if (seq1 == seq2) {
++				lastMusicSeq = seq1;
++				String name = new String(bytes, 0, n, StandardCharsets.US_ASCII);
++				if (!name.equals(musicName)) {
++					musicName = name;
++					stopMusic(minecraft);
++					nextMusicTry = 0;
++					musicTries = 0;
++				}
++			}
++		}
++		// (Re)start it: it loops, but a sound engine reload or a dimension change stops sounds. Not
++		// more often than every few seconds, and not forever: a track that won't start mustn't be
++		// retried every tick (each try loads, fails and logs: it made the game stutter).
++		long now = System.currentTimeMillis();
++		if (!musicName.isEmpty() && (music == null || !minecraft.getSoundManager().isActive(music)) && now >= nextMusicTry
++			&& musicTries < 5) {
++			Identifier id = Identifier.fromNamespaceAndPath(dev.skycraft.SkyCraft.MOD_ID, "music." + musicName.replace('/', '.'));
++			music = new SimpleSoundInstance(id, SoundSource.RECORDS, 1.0F, 1.0F, RandomSource.create(), true, 0,
++				SoundInstance.Attenuation.NONE, 0.0, 0.0, 0.0, true);
++			minecraft.getSoundManager().play(music);
++			nextMusicTry = now + 4000;
++			musicTries++;
++		}
++		if (music != null && minecraft.getSoundManager().isActive(music)) {
++			musicTries = 0;  // it's playing: a later stop (a reload) gets its tries again
++		}
++	}
++
++	private static long nextMusicTry;
++	private static int musicTries;
++
++	private static void stopMusic(Minecraft minecraft) {
++		if (music != null) {
++			minecraft.getSoundManager().stop(music);
++			music = null;
++		}
++	}
++
++	// ---- footsteps -----------------------------------------------------------------------------
++
++	private static void footsteps(Minecraft minecraft) {
++		var player = minecraft.player;
++		if (player == null) {
++			return;
++		}
++		double dx = player.getX() - lastX, dz = player.getZ() - lastZ;
++		lastX = player.getX();
++		lastZ = player.getZ();
++		if (!SkyLink.active() || !player.onGround() || player.isSpectator()) {
++			return;
++		}
++		// Minecraft's own pace: a step every 1/0.6 blocks walked.
++		double d = Math.sqrt(dx * dx + dz * dz);
++		if (d > 2.0) {
++			return; // a teleport, not a step
++		}
++		lastWalk += d;
++		if (lastWalk < 1.0 / 0.6) {
++			return;
++		}
++		lastWalk = 0.0;
++		if (player.isSilent() || player.isShiftKeyDown()) {
++			return;
++		}
++		// Standing on a Minecraft block: it played its own.
++		if (!minecraft.level.getBlockState(player.getOnPos()).isAir()) {
++			return;
++		}
++		int material = materialUnderFeet(player.getX(), player.getY(), player.getZ());
++		if (material <= 0) {
++			return;
++		}
++		var type = SkyDig.materialState(material).getSoundType();
++		minecraft.getSoundManager().play(new SimpleSoundInstance(type.getStepSound(), SoundSource.PLAYERS, type.getVolume() * 0.15F, type.getPitch(),
++			RandomSource.create(), player.getX(), player.getY(), player.getZ()));
++	}
++
++	/** The material of SM64's floor right under the player's feet (Proto.DIG_*), or 0. */
++	private static int materialUnderFeet(double x, double y, double z) {
++		TRIS.clear();
++		SkyCollision.trianglesNear(new AABB(x - 0.3, y - 0.6, z - 0.3, x + 0.3, y + 0.2, z + 0.3), TRIS);
++		int best = 0;
++		double bestY = Double.NEGATIVE_INFINITY;
++		for (SkyTri t : TRIS) {
++			if (t.ny < 0.4) {
++				continue;
++			}
++			double h = t.heightAt(x, z);
++			if (!Double.isNaN(h) && h <= y + 0.1 && h > bestY) {
++				bestY = h;
++				best = t.material == Proto.DIG_NONE ? Proto.DIG_STONE : t.material;
++			}
++		}
++		return best;
++	}
++
++	// ---- one-off sounds (IN_SOUND) ------------------------------------------------------------
++
++	public static void play(Minecraft minecraft, int code) {
++		if (minecraft.player == null) {
++			return;
++		}
++		String name = switch (code) {
++			case Proto.SOUND_POUND -> "entity.generic.big_fall";
++			case Proto.SOUND_BURN -> "entity.generic.burn";
++			case Proto.SOUND_PICKUP -> "entity.item.pickup";
++			case Proto.SOUND_THROW -> "entity.snowball.throw";
++			case Proto.SOUND_CRUSH -> "block.anvil.land";
++			default -> null;
++		};
++		if (name == null) {
++			return;
++		}
++		SoundEvent event = BuiltInRegistries.SOUND_EVENT.getValue(Identifier.withDefaultNamespace(name));
++		if (event != null) {
++			var p = minecraft.player;
++			minecraft.getSoundManager().play(new SimpleSoundInstance(event, SoundSource.PLAYERS, 1.0F, 1.0F, RandomSource.create(), p.getX(), p.getY(), p.getZ()));
++		}
++	}
++}
+diff --git a/fabric/src/client/java/dev/skycraft/client/MovingSurfaces.java b/fabric/src/client/java/dev/skycraft/client/MovingSurfaces.java
+new file mode 100644
+index 0000000..de70332
+--- /dev/null
++++ b/fabric/src/client/java/dev/skycraft/client/MovingSurfaces.java
+@@ -0,0 +1,238 @@
++package dev.skycraft.client;
++
++import static java.lang.foreign.ValueLayout.JAVA_DOUBLE;
++import static java.lang.foreign.ValueLayout.JAVA_INT;
++
++import dev.skycraft.link.Proto;
++import dev.skycraft.link.SkyLink;
++import dev.skycraft.world.SkyTri;
++import java.lang.foreign.MemorySegment;
++import java.lang.invoke.VarHandle;
++import java.util.List;
++import net.minecraft.client.player.LocalPlayer;
++import net.minecraft.world.phys.AABB;
++
++/**
++ * MarioCraft: SM64's moving and solid objects (platforms, elevators, seesaws, bridges, crates,
++ * "!" boxes, gates, Whomps...). SM64 rebuilds their collision every game frame and writes the
++ * triangles near the player, each with the object it belongs to and that object's transform,
++ * into a table at {@link Proto#OFF_MOVING}. The local player collides with them like with the
++ * level ({@link SkyCollider}), and while standing on one is carried along with it: whatever the
++ * object did since the last tick (moved, turned, tilted) is applied to the player's feet.
++ */
++public final class MovingSurfaces {
++	private static final VarHandle INT = JAVA_INT.varHandle();
++	private static final double UNITS = 100.0; // SM64 units per block
++	private static final double MAX_CARRY = 2.0; // blocks per tick; more means the object was replaced
++
++	private static int lastSeq = -1;
++	private static SkyTri[] tris = new SkyTri[0];
++	private static int[] triObject = new int[0]; // index into the objects below, or -1
++	private static long[] objectKeys = new long[0]; // id << 32 | gen
++	private static double[][] objectMatrices = new double[0][];
++	private static double originX;
++	private static int shiftY;
++
++	private static long ridingKey;
++	private static double[] ridingRef;
++
++	private MovingSurfaces() {
++	}
++
++	private static MemorySegment segment() {
++		MemorySegment s = SkyLink.segment();
++		if (s == null || (s.get(JAVA_INT, Proto.H_FEATURES) & Proto.FEATURE_MOVING) == 0) {
++			return null;
++		}
++		return s;
++	}
++
++	/** Picks up SM64's latest table (cheap when nothing changed). */
++	public static void refresh() {
++		MemorySegment s = segment();
++		if (s == null) {
++			if (tris.length > 0) {
++				tris = new SkyTri[0];
++				triObject = new int[0];
++				objectKeys = new long[0];
++				objectMatrices = new double[0][];
++			}
++			lastSeq = -1;
++			return;
++		}
++		long b = Proto.OFF_MOVING;
++		for (int attempt = 0; attempt < 50; attempt++) {
++			int seq1 = (int) INT.getAcquire(s, b + Proto.MV_SEQ);
++			if (seq1 == lastSeq) {
++				return;
++			}
++			if ((seq1 & 1) != 0 || seq1 == 0) {
++				Thread.onSpinWait();
++				if (seq1 == 0) {
++					return; // SM64 hasn't written one yet
++				}
++				continue;
++			}
++			int numObjects = Math.min(s.get(JAVA_INT, b + Proto.MV_NUM_OBJECTS), Proto.MV_MAX_OBJECTS);
++			int numTris = Math.min(s.get(JAVA_INT, b + Proto.MV_NUM_TRIS), Proto.MV_MAX_TRIS);
++			double ox = s.get(JAVA_DOUBLE, b + Proto.MV_ORIGIN_X);
++			int sy = s.get(JAVA_INT, b + Proto.MV_SHIFT_Y);
++			int[] objRaw = new int[Math.max(0, numObjects) * 20];
++			MemorySegment.copy(s, JAVA_INT, b + Proto.MV_OBJECTS, objRaw, 0, objRaw.length);
++			int[] triRaw = new int[Math.max(0, numTris) * 10];
++			MemorySegment.copy(s, JAVA_INT, b + Proto.MV_TRIS, triRaw, 0, triRaw.length);
++			VarHandle.loadLoadFence();
++			if ((int) INT.getAcquire(s, b + Proto.MV_SEQ) != seq1) {
++				continue; // SM64 wrote meanwhile: read again
++			}
++			lastSeq = seq1;
++			originX = ox;
++			shiftY = sy;
++			long[] keys = new long[numObjects];
++			double[][] matrices = new double[numObjects][];
++			for (int i = 0; i < numObjects; i++) {
++				int o = i * 20;
++				keys[i] = ((long) objRaw[o] << 32) | (objRaw[o + 1] & 0xFFFFFFFFL);
++				double[] m = new double[16];
++				for (int k = 0; k < 16; k++) {
++					m[k] = Float.intBitsToFloat(objRaw[o + 2 + k]);
++				}
++				matrices[i] = m;
++			}
++			SkyTri[] newTris = new SkyTri[numTris];
++			int[] owner = new int[numTris];
++			float[] v = new float[9];
++			int kept = 0;
++			for (int i = 0; i < numTris; i++) {
++				int t = i * 10;
++				for (int k = 0; k < 9; k += 3) {
++					v[k] = (float) (ox + Float.intBitsToFloat(triRaw[t + k]) / UNITS);
++					v[k + 1] = (float) ((Float.intBitsToFloat(triRaw[t + k + 1]) - sy) / UNITS);
++					v[k + 2] = (float) (Float.intBitsToFloat(triRaw[t + k + 2]) / UNITS);
++				}
++				int objFlags = triRaw[t + 9];
++				int obj = objFlags & 0xFFFF;
++				int flags = (objFlags >>> 16) & 0xFFFF;
++				SkyTri tri = new SkyTri(v, 0, flags);
++				if (tri.degenerate()) {
++					continue;
++				}
++				newTris[kept] = tri;
++				owner[kept] = obj < numObjects ? obj : -1;
++				kept++;
++			}
++			tris = java.util.Arrays.copyOf(newTris, kept);
++			triObject = java.util.Arrays.copyOf(owner, kept);
++			objectKeys = keys;
++			objectMatrices = matrices;
++			return;
++		}
++	}
++
++	/** Adds every moving triangle whose bounds overlap {@code box}. */
++	public static void trianglesNear(AABB box, List<SkyTri> out) {
++		for (SkyTri t : tris) {
++			if (t.maxX >= box.minX && t.minX <= box.maxX && t.maxY >= box.minY && t.minY <= box.maxY && t.maxZ >= box.minZ && t.minZ <= box.maxZ) {
++				out.add(t);
++			}
++		}
++	}
++
++	/** After the player moved: are their feet on one of the objects? Then that's what carries them. */
++	public static void afterMove(double x, double y, double z) {
++		long under = 0;
++		double best = Double.NEGATIVE_INFINITY;
++		SkyTri[] ts = tris;
++		int[] owners = triObject;
++		for (int i = 0; i < ts.length; i++) {
++			SkyTri t = ts[i];
++			int o = owners[i];
++			if (o < 0 || !t.walkable || t.maxY < y - 0.1 || t.minY > y + 0.1) {
++				continue;
++			}
++			for (int s = 0; s < 5; s++) {
++				double sx = x + (s == 1 ? 0.25 : s == 2 ? -0.25 : 0), sz = z + (s == 3 ? 0.25 : s == 4 ? -0.25 : 0);
++				double h = t.heightAt(sx, sz);
++				if (!Double.isNaN(h) && Math.abs(h - y) < 0.06 && h > best) {
++					best = h;
++					under = objectKeys[o];
++				}
++			}
++		}
++		if (under != ridingKey) {
++			ridingKey = under;
++			double[] m = under != 0 ? matrixOf(under) : null;
++			ridingRef = m != null ? m.clone() : null;
++			if (m == null) {
++				ridingKey = 0;
++			}
++		}
++	}
++
++	private static double[] matrixOf(long key) {
++		long[] keys = objectKeys;
++		for (int i = 0; i < keys.length; i++) {
++			if (keys[i] == key) {
++				return objectMatrices[i];
++			}
++		}
++		return null;
++	}
++
++	/** End of a client tick: what the object the player stands on did, happens to the player too. */
++	public static void carry(LocalPlayer player) {
++		refresh();
++		if (ridingKey == 0 || ridingRef == null) {
++			return;
++		}
++		double[] now = matrixOf(ridingKey);
++		if (now == null) {
++			ridingKey = 0; // gone
++			ridingRef = null;
++			return;
++		}
++		// The feet in SM64 units, back into the object's own space as it was, out as it is now.
++		double fx = (player.getX() - originX) * UNITS, fy = player.getY() * UNITS + shiftY, fz = player.getZ() * UNITS;
++		double[] local = inverseApply(ridingRef, fx, fy, fz);
++		if (local == null) {
++			ridingRef = now.clone();
++			return;
++		}
++		double nx = local[0] * now[0] + local[1] * now[4] + local[2] * now[8] + now[12];
++		double ny = local[0] * now[1] + local[1] * now[5] + local[2] * now[9] + now[13];
++		double nz = local[0] * now[2] + local[1] * now[6] + local[2] * now[10] + now[14];
++		ridingRef = now.clone();
++		double dx = (nx - fx) / UNITS, dy = (ny - fy) / UNITS, dz = (nz - fz) / UNITS;
++		if (dx * dx + dy * dy + dz * dz > MAX_CARRY * MAX_CARRY || (dx == 0 && dy == 0 && dz == 0)) {
++			return;
++		}
++		// Only the current position moves (not last tick's), so it's drawn as smooth motion.
++		player.setPos(player.getX() + dx, player.getY() + dy, player.getZ() + dz);
++	}
++
++	/** p = (q - t) * inverse(A), for a row-vector affine matrix m = [A; t]. */
++	private static double[] inverseApply(double[] m, double qx, double qy, double qz) {
++		double a = m[0], b = m[1], c = m[2];
++		double d = m[4], e = m[5], f = m[6];
++		double g = m[8], h = m[9], i = m[10];
++		double det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
++		if (Math.abs(det) < 1e-9) {
++			return null;
++		}
++		double inv = 1.0 / det;
++		// inverse(A), row-major
++		double i00 = (e * i - f * h) * inv, i01 = (c * h - b * i) * inv, i02 = (b * f - c * e) * inv;
++		double i10 = (f * g - d * i) * inv, i11 = (a * i - c * g) * inv, i12 = (c * d - a * f) * inv;
++		double i20 = (d * h - e * g) * inv, i21 = (b * g - a * h) * inv, i22 = (a * e - b * d) * inv;
++		double px = qx - m[12], py = qy - m[13], pz = qz - m[14];
++		return new double[] {
++			px * i00 + py * i10 + pz * i20,
++			px * i01 + py * i11 + pz * i21,
++			px * i02 + py * i12 + pz * i22,
++		};
++	}
++
++	public static boolean riding() {
++		return ridingKey != 0;
++	}
++}
+diff --git a/fabric/src/client/java/dev/skycraft/client/SkyClient.java b/fabric/src/client/java/dev/skycraft/client/SkyClient.java
+index 3127e6e..cb6ddb6 100644
+--- a/fabric/src/client/java/dev/skycraft/client/SkyClient.java
++++ b/fabric/src/client/java/dev/skycraft/client/SkyClient.java
+@@ -45,6 +45,7 @@ public final class SkyClient {
+ 	private static long frameCounter;
+ 	private static int lastPacedSeq;
+ 	private static boolean skyrimStalled;
++	private static long lastSkyFrameNanos;
+ 	private static int exporterErrors;
+ 
+ 	private SkyClient() {
+@@ -130,6 +131,7 @@ public final class SkyClient {
+ 		}
+ 		if (teleportPending && sky.inGame() && !sky.loading()) {
+ 			requestTeleport(minecraft, sky.x, sky.y, sky.z, sky.yaw, sky.pitch);
++			InputBridge.safeLanding(minecraft); // MarioCraft: dropping in where SM64 put us doesn't hurt
+ 			teleportAck = sky.teleportSeq;
+ 			teleportPending = false;
+ 			holdPos = new Vec3(sky.x, sky.y, sky.z);
+@@ -185,12 +187,87 @@ public final class SkyClient {
+ 	public static void clientTick(Minecraft minecraft) {
+ 		MirrorWorld.tick(minecraft);
+ 		DiscordPresence.tick(minecraft);
++		MarioLobby.tick(minecraft);
+ 		SkyDigClient.tick(minecraft);
+ 		freezeWhileUnlinked(minecraft);
+ 		holdUntilReady(minecraft);
++		followMario(minecraft);
++		// MarioCraft: standing on an SM64 platform carries the player along with it.
++		if (linked && minecraft.player != null && !sky.puppet() && !minecraft.player.noPhysics) {
++			MovingSurfaces.carry(minecraft.player);
++		}
++		wingCap(minecraft);
+ 		publishTick(minecraft);
+ 	}
+ 
++	private static boolean wingFlight;
++
++	/**
++	 * MarioCraft: while Mario has SM64's wing cap, the player can fly like in creative mode
++	 * (double-tap Space); when it runs out they drop. Set on the integrated server's player too,
++	 * which is the one that decides whether flying is allowed.
++	 */
++	private static void wingCap(Minecraft minecraft) {
++		LocalPlayer player = minecraft.player;
++		if (player == null || player.isCreative() || player.isSpectator()) {
++			return;
++		}
++		boolean wing = linked && sky.inGame() && (sky.flags & Proto.SKY_WING_CAP) != 0;
++		if (wing == wingFlight) {
++			return;
++		}
++		wingFlight = wing;
++		player.getAbilities().mayfly = wing;
++		if (!wing) {
++			player.getAbilities().flying = false;
++		}
++		var server = minecraft.getSingleplayerServer();
++		if (server != null) {
++			var uuid = player.getUUID();
++			server.execute(() -> {
++				ServerPlayer sp = server.getPlayerList().getPlayer(uuid);
++				if (sp != null && !sp.isCreative() && !sp.isSpectator()) {
++					sp.getAbilities().mayfly = wing;
++					if (!wing) {
++						sp.getAbilities().flying = false;
++					}
++					sp.onUpdateAbilities();
++				}
++			});
++		}
++	}
++
++	/** MarioCraft: SM64 is showing a cutscene with the player in it: export their body. */
++	public static boolean showBody() {
++		return linked && (sky.flags & Proto.SKY_SHOW_BODY) != 0;
++	}
++
++	/**
++	 * MarioCraft: something in SM64 is carrying the player (a cannon shot, a pole, Hoot, a Koopa
++	 * shell, a tornado, being thrown), and SM64's physics decide where they go: the player is put
++	 * there. Runs at the end of every client tick, after Minecraft's own movement, so whatever
++	 * Minecraft physics did this tick is overwritten. The previous tick's position (xo/yo/zo) is
++	 * left alone, so Minecraft still interpolates smoothly between ticks. The camera, the view and
++	 * the hands are the player's own as usual.
++	 */
++	private static boolean wasPuppet;
++
++	private static void followMario(Minecraft minecraft) {
++		LocalPlayer player = minecraft.player;
++		boolean puppet = linked && player != null && sky.puppet() && sky.inGame() && !sky.loading();
++		if (wasPuppet && !puppet && player != null) {
++			InputBridge.safeLanding(minecraft); // let go in mid-air (a cannon shot, a pole, Hoot): Mario lands unhurt
++		}
++		wasPuppet = puppet;
++		if (!puppet) {
++			return;
++		}
++		holdPos = null; // never wait for collision: SM64 decides where the ground is
++		player.setDeltaMovement(Vec3.ZERO);
++		player.setPos(sky.x, sky.y, sky.z);
++		player.resetFallDistance();
++	}
++
+ 	/**
+ 	 * Skyrim went quiet (a long loading screen, a stall, or it closed). Its collision around the
+ 	 * player may be about to change (interior doors), so keep the player exactly where they were
+@@ -353,9 +430,12 @@ public final class SkyClient {
+ 			if (player.isSwimming()) {
+ 				flags |= Proto.MC_SWIMMING;
+ 			}
+-			if (player.getAbilities().flying) {
++			if (player.getAbilities().flying || player.isFallFlying()) {
+ 				flags |= Proto.MC_FLYING;
+ 			}
++			if (player.isInWater() || player.isInLava() || player.onClimbable()) {
++				flags |= Proto.MC_IN_FLUID;
++			}
+ 			mc.x = feet.x;
+ 			mc.y = feet.y;
+ 			mc.z = feet.z;
+@@ -399,26 +479,45 @@ public final class SkyClient {
+ 		}
+ 	}
+ 
+-	/** End of the frame: render at most once per Skyrim frame instead of spinning freely. */
++	/**
++	 * End of the frame: render once per frame of the game we're linked to (MarioCraft: once per
++	 * SM64 frame), instead of spinning freely. It used to stop waiting after 25 ms without a new
++	 * frame and then run unthrottled until the next one came; SM64 at 30 fps (33 ms a frame) hit
++	 * that every frame, so Minecraft drew hundreds of frames a second for nothing and took the GPU
++	 * away from SM64. Now it waits up to 100 ms, and only when the game has really stopped (paused,
++	 * minimised: nothing new for half a second) does it keep drawing on its own, at about 20 fps.
++	 */
+ 	public static void paceFrame() {
+ 		if (!linked) {
+ 			return;
+ 		}
+-		if (skyrimStalled && (SkyLink.skyStateSeq() >>> 1) == lastPacedSeq) {
+-			return; // Skyrim is paused (menu / alt-tab): don't block every frame waiting for it
++		long now = System.nanoTime();
++		int seq = SkyLink.skyStateSeq() >>> 1;
++		if (seq != lastPacedSeq) {
++			// A new frame came in while we were drawing: draw the next one straight away.
++			lastPacedSeq = seq;
++			lastSkyFrameNanos = now;
++			return;
+ 		}
+-		skyrimStalled = false;
+-		long deadline = System.nanoTime() + 25_000_000L;
+-		// SkyState.seq advances by 2 per Skyrim frame (odd while writing).
+-		while ((SkyLink.skyStateSeq() >>> 1) == lastPacedSeq && System.nanoTime() < deadline) {
+-			Thread.onSpinWait();
+-			if (deadline - System.nanoTime() > 2_000_000L) {
++		boolean stopped = now - lastSkyFrameNanos > 500_000_000L;
++		long deadline = now + (stopped ? 50_000_000L : 100_000_000L);
++		while ((SkyLink.skyStateSeq() >>> 1) == lastPacedSeq) {
++			long left = deadline - System.nanoTime();
++			if (left <= 0) {
++				break;
++			}
++			if (left > 3_000_000L) {
+ 				Thread.yield();
++			} else {
++				Thread.onSpinWait();
+ 			}
+ 		}
+ 		int seqNow = SkyLink.skyStateSeq() >>> 1;
+-		skyrimStalled = seqNow == lastPacedSeq;
+-		lastPacedSeq = seqNow;
++		if (seqNow != lastPacedSeq) {
++			lastPacedSeq = seqNow;
++			lastSkyFrameNanos = System.nanoTime();
++		}
++		skyrimStalled = stopped;
+ 	}
+ 
+ 	private static void applyLinkedOptions() {
+@@ -433,6 +532,8 @@ public final class SkyClient {
+ 		options.renderDistance().set(8);
+ 		options.simulationDistance().set(8);
+ 		options.autoJump().set(false);
++		// MarioCraft: brightness at "Bright", so what Steve holds is never drawn dark.
++		options.gamma().set(1.0);
+ 		options.onboardAccessibility = false;
+ 		if (options.tutorialStep != net.minecraft.client.tutorial.TutorialSteps.NONE) {
+ 			minecraft.getTutorial().setStep(net.minecraft.client.tutorial.TutorialSteps.NONE);
+diff --git a/fabric/src/client/java/dev/skycraft/client/SkyCollider.java b/fabric/src/client/java/dev/skycraft/client/SkyCollider.java
+index e0e555a..5664176 100644
+--- a/fabric/src/client/java/dev/skycraft/client/SkyCollider.java
++++ b/fabric/src/client/java/dev/skycraft/client/SkyCollider.java
+@@ -19,14 +19,21 @@ public final class SkyCollider {
+ 		AABB box = player.getBoundingBox();
+ 		double step = player.maxUpStep();
+ 		List<SkyTri> tris = new ArrayList<>();
+-		SkyCollision.trianglesNear(box.expandTowards(move).inflate(1.0, 1.0 + step, 1.0), tris);
++		AABB near = box.expandTowards(move).inflate(1.0, 1.0 + step, 1.0);
++		SkyCollision.trianglesNear(near, tris);
++		// MarioCraft: SM64's platforms, crates, gates... (where they are this frame).
++		MovingSurfaces.refresh();
++		MovingSurfaces.trianglesNear(near, tris);
++		double cx = (box.minX + box.maxX) * 0.5, cz = (box.minZ + box.maxZ) * 0.5;
+ 		if (tris.isEmpty()) {
++			MovingSurfaces.afterMove(cx + move.x, box.minY + move.y, cz + move.z);
+ 			return move;
+ 		}
+ 		double[] r = TriCollider.resolve(
+-			tris, (box.minX + box.maxX) * 0.5, box.minY, (box.minZ + box.maxZ) * 0.5, box.getXsize() * 0.5, box.getYsize(), step, player.onGround(),
++			tris, cx, box.minY, cz, box.getXsize() * 0.5, box.getYsize(), step, player.onGround(),
+ 			move.x, move.y, move.z
+ 		);
++		MovingSurfaces.afterMove(cx + r[0], box.minY + r[1], cz + r[2]);
+ 		if (r[0] == move.x && r[1] == move.y && r[2] == move.z) {
+ 			return move;
+ 		}
+diff --git a/fabric/src/client/java/dev/skycraft/client/SkyCraftClient.java b/fabric/src/client/java/dev/skycraft/client/SkyCraftClient.java
+index bb88ce8..1fe6a54 100644
+--- a/fabric/src/client/java/dev/skycraft/client/SkyCraftClient.java
++++ b/fabric/src/client/java/dev/skycraft/client/SkyCraftClient.java
+@@ -30,6 +30,13 @@ public final class SkyCraftClient implements ClientModInitializer {
+ 			}));
+ 		});
+ 		ClientTickEvents.END_CLIENT_TICK.register(SkyClient::clientTick);
++		// MarioCraft multiplayer: a guest's own SM64 enemies are hittable on the host's server too.
++		GuestActorsClient.register();
++		ClientTickEvents.END_CLIENT_TICK.register(GuestActorsClient::tick);
++		ClientTickEvents.END_CLIENT_TICK.register(GuestShapeClient::tick);
++		// MarioCraft: C418's music for each level, footsteps on SM64's ground, and power-up effects.
++		ClientTickEvents.END_CLIENT_TICK.register(MarioSounds::tick);
++		ClientTickEvents.END_CLIENT_TICK.register(MarioCaps::tick);
+ 		// Multiplayer testing on one PC: SKYCRAFT_LAN_PORT opens the world to LAN on that port as soon
+ 		// as it's loaded, and SKYCRAFT_LAN_OFFLINE lets offline (dev) clients join it.
+ 		net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents.JOIN.register((handler, sender, minecraft) -> {
+diff --git a/fabric/src/client/java/dev/skycraft/client/SkyDigClient.java b/fabric/src/client/java/dev/skycraft/client/SkyDigClient.java
+index 2af64e9..13a6847 100644
+--- a/fabric/src/client/java/dev/skycraft/client/SkyDigClient.java
++++ b/fabric/src/client/java/dev/skycraft/client/SkyDigClient.java
+@@ -113,6 +113,18 @@ public final class SkyDigClient {
+ 		return true;
+ 	}
+ 
++	/**
++	 * The Skyrim cell being mined right now and how far along, as {x, y, z, crack stage 0..9}, or
++	 * null: its crack is drawn like a Minecraft block's (WorldExporter).
++	 */
++	public static int @Nullable [] crack() {
++		BlockPos pos = mining;
++		if (pos == null || ticks - miningTick > 2) {
++			return null;
++		}
++		return new int[] { pos.getX(), pos.getY(), pos.getZ(), Math.max(0, Math.min(9, (int) (progress * 10.0F))) };
++	}
++
+ 	/** Any block change on this client: a dug block that broke gets what's around it revealed. */
+ 	public static void blockChanged(ClientLevel level, BlockPos pos, BlockState before, BlockState after) {
+ 		if (before.isAir() || !(after.isAir() || after.canBeReplaced())) {
+diff --git a/fabric/src/client/java/dev/skycraft/client/mixin/AvatarSittingMixin.java b/fabric/src/client/java/dev/skycraft/client/mixin/AvatarSittingMixin.java
+new file mode 100644
+index 0000000..30a6f79
+--- /dev/null
++++ b/fabric/src/client/java/dev/skycraft/client/mixin/AvatarSittingMixin.java
+@@ -0,0 +1,28 @@
++package dev.skycraft.client.mixin;
++
++import dev.skycraft.client.SkyClient;
++import dev.skycraft.link.SkyLink;
++import net.minecraft.client.Minecraft;
++import net.minecraft.client.renderer.entity.player.AvatarRenderer;
++import net.minecraft.client.renderer.entity.state.AvatarRenderState;
++import net.minecraft.world.entity.Avatar;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++/**
++ * MarioCraft: sliding down a slide (Princess's Secret Slide, the penguin race, Tall Tall Mountain's
++ * slide) Steve sits, as Mario slides on his backside: drawn the way Minecraft draws a rider. In F5,
++ * and in the body SM64 is sent.
++ */
++@Mixin(AvatarRenderer.class)
++public abstract class AvatarSittingMixin {
++	@Inject(method = "extractRenderState(Lnet/minecraft/world/entity/Avatar;Lnet/minecraft/client/renderer/entity/state/AvatarRenderState;F)V",
++		at = @At("TAIL"))
++	private void skycraft$sitOnSlides(Avatar entity, AvatarRenderState state, float partialTick, CallbackInfo ci) {
++		if (entity == Minecraft.getInstance().player && SkyLink.active() && SkyClient.sky().sliding()) {
++			state.isPassenger = true;
++		}
++	}
++}
+diff --git a/fabric/src/client/java/dev/skycraft/client/mixin/MinecraftDigMixin.java b/fabric/src/client/java/dev/skycraft/client/mixin/MinecraftDigMixin.java
+index ec9f6f9..f2636ab 100644
+--- a/fabric/src/client/java/dev/skycraft/client/mixin/MinecraftDigMixin.java
++++ b/fabric/src/client/java/dev/skycraft/client/mixin/MinecraftDigMixin.java
+@@ -25,8 +25,12 @@ public abstract class MinecraftDigMixin {
+ 
+ 	@Inject(method = "continueAttack", at = @At("HEAD"))
+ 	private void skycraft$digHold(boolean down, CallbackInfo ci) {
+-		if (down) {
+-			SkyDigClient.attack((Minecraft) (Object) this);
++		Minecraft minecraft = (Minecraft) (Object) this;
++		if (down && SkyDigClient.attack(minecraft)) {
++			// Keep swinging while mining, as with any block (Minecraft itself only does that for
++			// its own blocks, and Skyrim's ground isn't one).
++			var held = minecraft.player.getItemInHand(InteractionHand.MAIN_HAND);
++			minecraft.player.swing(InteractionHand.MAIN_HAND, held.getAttackAnimation(), false);
+ 		}
+ 	}
+ }
+diff --git a/fabric/src/client/java/dev/skycraft/client/render/AvatarExporter.java b/fabric/src/client/java/dev/skycraft/client/render/AvatarExporter.java
+index 5442db6..0c77179 100644
+--- a/fabric/src/client/java/dev/skycraft/client/render/AvatarExporter.java
++++ b/fabric/src/client/java/dev/skycraft/client/render/AvatarExporter.java
+@@ -142,7 +142,8 @@ final class AvatarExporter implements SubmitNodeCollector {
+ 		this.atlas = atlas;
+ 		var player = minecraft.player;
+ 		Camera camera = minecraft.gameRenderer.mainCamera();
+-		if (player == null || !camera.isDetached()) {
++		// MarioCraft: SM64's cutscenes show the player standing there, whatever the camera mode.
++		if (player == null || (!camera.isDetached() && !dev.skycraft.client.SkyClient.showBody())) {
+ 			this.sendEmpty(Proto.REN_AVATAR, false);
+ 			return;
+ 		}
+@@ -647,7 +648,7 @@ final class AvatarExporter implements SubmitNodeCollector {
+ 	}
+ 
+ 	/** A texture's pixels: resource packs, a runtime texture (downloaded skins), or an atlas. Caller closes it. */
+-	private static @Nullable NativeImage readTexture(Identifier texture) {
++	static @Nullable NativeImage readTexture(Identifier texture) {
+ 		Minecraft minecraft = Minecraft.getInstance();
+ 		var resource = minecraft.getResourceManager().getResource(texture);
+ 		if (resource.isPresent()) {
+diff --git a/fabric/src/client/java/dev/skycraft/client/render/SkinFace.java b/fabric/src/client/java/dev/skycraft/client/render/SkinFace.java
+new file mode 100644
+index 0000000..afd2d73
+--- /dev/null
++++ b/fabric/src/client/java/dev/skycraft/client/render/SkinFace.java
+@@ -0,0 +1,49 @@
++package dev.skycraft.client.render;
++
++import com.mojang.blaze3d.platform.NativeImage;
++import net.minecraft.client.Minecraft;
++import net.minecraft.resources.Identifier;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * MarioCraft: the player's face from their skin (the 8x8 face and the hat layer over it), for SM64's
++ * HUD head (mc_steve.c): you see your own Steve next to the lives counter.
++ */
++public final class SkinFace {
++	private static @Nullable Identifier lastSkin;
++	private static int @Nullable [] lastFace;
++
++	private SkinFace() {
++	}
++
++	/** 64 pixels, RGBA (r in the low byte), or null if the skin can't be read yet. */
++	public static int @Nullable [] face(Minecraft minecraft) {
++		if (minecraft.player == null) {
++			return null;
++		}
++		Identifier skin = minecraft.player.getSkin().body().texturePath();
++		if (skin.equals(lastSkin) && lastFace != null) {
++			return lastFace;
++		}
++		NativeImage image = AvatarExporter.readTexture(skin);
++		if (image == null) {
++			return null; // (a downloaded skin may not be there yet)
++		}
++		try {
++			int[] face = new int[64];
++			for (int y = 0; y < 8; y++) {
++				for (int x = 0; x < 8; x++) {
++					int base = image.getPixel(8 + x, 8 + y);   // ABGR
++					int hat = image.getWidth() >= 48 ? image.getPixel(40 + x, 8 + y) : 0;
++					int c = ((hat >>> 24) & 0xFF) >= 128 ? hat : base;
++					face[y * 8 + x] = c | 0xFF000000; // ABGR is RGBA with r in the low byte
++				}
++			}
++			lastSkin = skin;
++			lastFace = face;
++			return face;
++		} finally {
++			image.close();
++		}
++	}
++}
+diff --git a/fabric/src/client/java/dev/skycraft/client/render/WorldExporter.java b/fabric/src/client/java/dev/skycraft/client/render/WorldExporter.java
+index 9f909ce..2896a2f 100644
+--- a/fabric/src/client/java/dev/skycraft/client/render/WorldExporter.java
++++ b/fabric/src/client/java/dev/skycraft/client/render/WorldExporter.java
+@@ -431,6 +431,16 @@ public final class WorldExporter {
+ 				new float[] { (float) box.getXsize(), (float) box.getYsize(), (float) box.getZsize() }, atlas.crackUv(stage), 0
+ 			));
+ 		}
++		// The Skyrim (MarioCraft: SM64) ground being mined: it isn't a Minecraft block, so Minecraft
++		// keeps no crack for it; the cell SkyDigClient is digging gets one the same way.
++		int[] dig = dev.skycraft.client.SkyDigClient.crack();
++		if (dig != null && ENTITIES.size() < Proto.MAX_WORLD_ENTITIES) {
++			float g = 0.004F;
++			ENTITIES.add(new SkyLink.WorldEntity(
++				Proto.WE_CRACK, 0x5D16C4A1, dig[0] - g, dig[1] - g, dig[2] - g, 0.0F, 0.0F, 1.0F,
++				new float[] { 1.0F + 2 * g, 1.0F + 2 * g, 1.0F + 2 * g }, atlas.crackUv(dig[3]), 0
++			));
++		}
+ 	}
+ 
+ 	/** The item's icon in the combined atlas {u0, v0, u1, v1}, or null. */
+diff --git a/fabric/src/client/resources/skycraft.client.mixins.json b/fabric/src/client/resources/skycraft.client.mixins.json
+index c30d0c7..4f9fb90 100644
+--- a/fabric/src/client/resources/skycraft.client.mixins.json
++++ b/fabric/src/client/resources/skycraft.client.mixins.json
+@@ -3,6 +3,7 @@
+   "package": "dev.skycraft.client.mixin",
+   "compatibilityLevel": "JAVA_25",
+   "client": [
++    "AvatarSittingMixin",
+     "CameraZoomMixin",
+     "ChatComponentMixin",
+     "ClientLevelAccessor",
+diff --git a/fabric/src/main/java/dev/skycraft/SkyCraft.java b/fabric/src/main/java/dev/skycraft/SkyCraft.java
+index 1670d74..ee2ef9b 100644
+--- a/fabric/src/main/java/dev/skycraft/SkyCraft.java
++++ b/fabric/src/main/java/dev/skycraft/SkyCraft.java
+@@ -15,7 +15,7 @@ import org.slf4j.LoggerFactory;
+ 
+ public final class SkyCraft implements ModInitializer {
+ 	public static final String MOD_ID = "skycraft";
+-	public static final String WORLD_NAME = "SkyCraft";
++	public static final String WORLD_NAME = "MarioCraft"; // a fresh world, with the MarioCraft starter kit
+ 	public static final Logger LOG = LoggerFactory.getLogger(MOD_ID);
+ 	private static final String KIT2_TAG = "skycraft_builder_kit";
+ 
+@@ -24,6 +24,10 @@ public final class SkyCraft implements ModInitializer {
+ 		SkyCombat.init();
+ 		dev.skycraft.net.SkyNet.init();
+ 		dev.skycraft.world.SkyDig.init();
++		dev.skycraft.world.MarioAllies.init();
++		dev.skycraft.world.MarioFalls.init();
++		dev.skycraft.world.MarioLives.init();
++		// MarioCraft: mobs come from spawn eggs and /summon (MarioMobs.init() would spawn them automatically).
+ 		ServerLifecycleEvents.SERVER_STARTED.register(SkyCraft::configureServer);
+ 		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
+ 			giveStarterKit(handler.getPlayer());
+@@ -32,7 +36,10 @@ public final class SkyCraft implements ModInitializer {
+ 		});
+ 	}
+ 
+-	/** The mirror world is a void that only exists to host the player; Skyrim drives time and spawning. */
++	/**
++	 * The mirror world is a void that only exists to host the player. MarioCraft: it stays noon, so
++	 * what Steve holds is lit properly (/time set midnight for monsters that don't burn in the sun).
++	 */
+ 	private static void configureServer(MinecraftServer server) {
+ 		GameRules rules = server.getGameRules();
+ 		rules.set(GameRules.ADVANCE_TIME, false, server);
+@@ -72,19 +79,25 @@ public final class SkyCraft implements ModInitializer {
+ 		LOG.info("SkyCraft: dressed test guest {} in iron and diamond", player.getName().getString());
+ 	}
+ 
++	/** MarioCraft: building blocks in the hotbar (Y in SM64 cycles through them), tools after. */
+ 	private static void giveStarterKit(ServerPlayer player) {
+ 		if (!player.getInventory().isEmpty()) {
+ 			return;
+ 		}
+-		player.getInventory().add(new ItemStack(Items.DIAMOND_SWORD));
+-		player.getInventory().add(new ItemStack(Items.DIAMOND_PICKAXE));
+-		player.getInventory().add(new ItemStack(Items.BOW));
+-		player.getInventory().add(new ItemStack(Items.COOKED_BEEF, 32));
+-		player.getInventory().add(new ItemStack(Items.OAK_PLANKS, 64));
+-		player.getInventory().add(new ItemStack(Items.TORCH, 32));
+-		player.getInventory().add(new ItemStack(Items.ARROW, 64));
+-		player.setItemSlot(net.minecraft.world.entity.EquipmentSlot.OFFHAND, new ItemStack(Items.SHIELD));
+-		LOG.info("SkyCraft: gave starter kit to {}", player.getName().getString());
++		var inventory = player.getInventory();
++		inventory.add(new ItemStack(Items.GRASS_BLOCK, 64));
++		inventory.add(new ItemStack(Items.DIRT, 64));
++		inventory.add(new ItemStack(Items.STONE, 64));
++		inventory.add(new ItemStack(Items.OAK_PLANKS, 64));
++		inventory.add(new ItemStack(Items.COBBLESTONE, 64));
++		inventory.add(new ItemStack(Items.OAK_LOG, 64));
++		inventory.add(new ItemStack(Items.GLASS, 64));
++		inventory.add(new ItemStack(Items.BRICKS, 64));
++		inventory.add(new ItemStack(Items.DIAMOND_PICKAXE));
++		inventory.add(new ItemStack(Items.TORCH, 64));
++		inventory.add(new ItemStack(Items.DIAMOND_SWORD));
++		inventory.add(new ItemStack(Items.COOKED_BEEF, 32));
++		LOG.info("MarioCraft: gave starter kit to {}", player.getName().getString());
+ 	}
+ 
+ 	/**
+diff --git a/fabric/src/main/java/dev/skycraft/combat/SkyCombat.java b/fabric/src/main/java/dev/skycraft/combat/SkyCombat.java
+index fccb371..44bbba1 100644
+--- a/fabric/src/main/java/dev/skycraft/combat/SkyCombat.java
++++ b/fabric/src/main/java/dev/skycraft/combat/SkyCombat.java
+@@ -55,7 +55,13 @@ public final class SkyCombat {
+ 	/** Skyrim damage is divided by this for Minecraft (a 15-damage bandit swing = 3 = 1.5 hearts). */
+ 	public static final float SKYRIM_TO_MC_DAMAGE = 5.0F;
+ 
+-	private static final Map<Integer, SkyrimActorEntity> PROXIES = new HashMap<>();
++	// MarioCraft: stand-ins by whose game their actor is in. The host's come from the shared memory;
++	// each guest's from their own SM64 through SkyNet.GuestActors (they can be in another level).
++	// Hits go back to that player's game.
++	private static final java.util.UUID HOST = new java.util.UUID(0L, 0L);
++	private static final Map<java.util.UUID, Map<Integer, SkyrimActorEntity>> OWNERS = new HashMap<>();
++	private static final Map<java.util.UUID, List<SkyLink.Actor>> GUEST_ACTORS = new HashMap<>();
++	private static final Map<java.util.UUID, Long> GUEST_HEARD = new HashMap<>();
+ 	private static final List<SkyLink.Actor> ACTORS = new ArrayList<>();
+ 
+ 	private SkyCombat() {
+@@ -66,8 +72,20 @@ public final class SkyCombat {
+ 		ServerTickEvents.END_SERVER_TICK.register(SkyCombat::serverTick);
+ 	}
+ 
++	/** The host's stand-in for an actor, or null. */
+ 	public static @Nullable SkyrimActorEntity proxy(int formId) {
+-		return PROXIES.get(formId);
++		Map<Integer, SkyrimActorEntity> host = OWNERS.get(HOST);
++		return host != null ? host.get(formId) : null;
++	}
++
++	/** MarioCraft: a guest's SM64 enemies around them (SkyNet.GuestActors), on the server thread. */
++	public static void guestActors(ServerPlayer player, List<dev.skycraft.net.SkyNet.GuestActor> actors) {
++		List<SkyLink.Actor> list = new ArrayList<>(actors.size());
++		for (var a : actors) {
++			list.add(new SkyLink.Actor(a.formId(), a.flags(), a.x(), a.y(), a.z(), a.yaw(), a.width(), a.height(), 1.0F, 1, a.name()));
++		}
++		GUEST_ACTORS.put(player.getUUID(), list);
++		GUEST_HEARD.put(player.getUUID(), System.currentTimeMillis());
+ 	}
+ 
+ 	private static void serverTick(MinecraftServer server) {
+@@ -81,26 +99,64 @@ public final class SkyCombat {
+ 			pickUpNearby(player);
+ 		}
+ 		if (SkyLink.readActors(ACTORS)) {
+-			sync(level);
+-		}
+-		// Hits land during the tick (melee, sweeps, arrows, fire); send one combined hit per actor.
+-		for (SkyrimActorEntity proxy : PROXIES.values()) {
+-			float[] hit = proxy.takeHit();
+-			if (hit != null && (hit[0] > 0.0F || hit[3] > 0.0F)) {
+-				SkyLink.pushEvent(
+-					Proto.EV_HIT_ACTOR, proxy.formId(), hit[0], hit[1], hit[2], hit[3], Float.floatToRawIntBits(hit[4]), Float.floatToRawIntBits(hit[5])
+-				);
++			sync(level, HOST, ACTORS, null);
++		}
++		// Guests' own enemies (a second old at most: they send them every other tick).
++		long now = System.currentTimeMillis();
++		java.util.Set<java.util.UUID> keep = new java.util.HashSet<>();
++		keep.add(HOST);
++		for (ServerPlayer player : players) {
++			java.util.UUID id = player.getUUID();
++			List<SkyLink.Actor> actors = GUEST_ACTORS.get(id);
++			if (dev.skycraft.net.SkyNet.isHost(player) || actors == null || now - GUEST_HEARD.getOrDefault(id, 0L) > 1000) {
++				continue;
++			}
++			keep.add(id);
++			sync(level, id, actors, OWNERS.get(HOST));
++		}
++		for (Iterator<Map.Entry<java.util.UUID, Map<Integer, SkyrimActorEntity>>> it = OWNERS.entrySet().iterator(); it.hasNext(); ) {
++			Map.Entry<java.util.UUID, Map<Integer, SkyrimActorEntity>> e = it.next();
++			if (!keep.contains(e.getKey())) {
++				e.getValue().values().forEach(Entity::discard);
++				it.remove();
++			}
++		}
++		GUEST_ACTORS.keySet().retainAll(keep);
++		GUEST_HEARD.keySet().retainAll(keep);
++		// Hits land during the tick (melee, sweeps, arrows, fire, allied mobs); one combined hit per
++		// actor, to the game it's in.
++		for (Map.Entry<java.util.UUID, Map<Integer, SkyrimActorEntity>> e : OWNERS.entrySet()) {
++			ServerPlayer guest = e.getKey().equals(HOST) ? null : server.getPlayerList().getPlayer(e.getKey());
++			for (SkyrimActorEntity proxy : e.getValue().values()) {
++				float[] hit = proxy.takeHit();
++				if (hit == null || !(hit[0] > 0.0F || hit[3] > 0.0F)) {
++					continue;
++				}
++				int flags = Float.floatToRawIntBits(hit[4]), weapon = Float.floatToRawIntBits(hit[5]);
++				if (guest == null) {
++					SkyLink.pushEvent(Proto.EV_HIT_ACTOR, proxy.formId(), hit[0], hit[1], hit[2], hit[3], flags, weapon);
++				} else {
++					net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.send(guest,
++						new dev.skycraft.net.SkyNet.HitActor(proxy.formId(), hit[0], hit[1], hit[2], hit[3], flags, weapon));
++				}
+ 				SkyCraft.LOG.info("SkyCraft: hit {} for {} (knockback {})", proxy.getName().getString(), hit[0], hit[3]);
+ 			}
+ 		}
+ 	}
+ 
+-	private static void sync(ServerLevel level) {
++	/**
++	 * One game's actors to its stand-ins. {@code avoid}: the host's stand-ins; a guest's actor where
++	 * one of those already is (the same enemy, both players in the same level) gets none of its own,
++	 * so it isn't hit twice.
++	 */
++	private static void sync(ServerLevel level, java.util.UUID owner, List<SkyLink.Actor> actors, @Nullable Map<Integer, SkyrimActorEntity> avoid) {
++		Map<Integer, SkyrimActorEntity> PROXIES = OWNERS.computeIfAbsent(owner, k -> new HashMap<>());
+ 		Map<Integer, SkyLink.Actor> live = new HashMap<>();
+-		for (SkyLink.Actor a : ACTORS) {
+-			if (!a.dead()) {
+-				live.put(a.formId(), a);
++		for (SkyLink.Actor a : actors) {
++			if (a.dead() || (avoid != null && covered(avoid, a))) {
++				continue;
+ 			}
++			live.put(a.formId(), a);
+ 		}
+ 		for (Iterator<Map.Entry<Integer, SkyrimActorEntity>> it = PROXIES.entrySet().iterator(); it.hasNext(); ) {
+ 			Map.Entry<Integer, SkyrimActorEntity> e = it.next();
+@@ -116,6 +172,7 @@ public final class SkyCombat {
+ 			if (proxy == null) {
+ 				proxy = new SkyrimActorEntity(SKYRIM_ACTOR, level);
+ 				proxy.setFormId(a.formId());
++				proxy.setHostile(a.hostile());
+ 				proxy.setSize(a.width(), a.height());
+ 				proxy.snapTo(a.x(), a.y(), a.z(), a.yaw(), 0.0F);
+ 				if (!a.name().isEmpty()) {
+@@ -127,7 +184,11 @@ public final class SkyCombat {
+ 				PROXIES.put(a.formId(), proxy);
+ 				continue;
+ 			}
++			proxy.setHostile(a.hostile());
+ 			proxy.setSize(a.width(), a.height());
++			if (!a.name().isEmpty() && (proxy.getCustomName() == null || !a.name().equals(proxy.getCustomName().getString()))) {
++				proxy.setCustomName(Component.literal(a.name()));  // (MarioCraft: "Goomba", not "Skyrim NPC")
++			}
+ 			proxy.setPos(a.x(), a.y(), a.z());
+ 			proxy.setYRot(a.yaw());
+ 			proxy.setYHeadRot(a.yaw());
+@@ -138,6 +199,16 @@ public final class SkyCombat {
+ 		}
+ 	}
+ 
++	private static boolean covered(Map<Integer, SkyrimActorEntity> proxies, SkyLink.Actor a) {
++		for (SkyrimActorEntity p : proxies.values()) {
++			double dx = p.getX() - a.x(), dy = p.getY() - a.y(), dz = p.getZ() - a.z();
++			if (dx * dx + dy * dy + dz * dz < 1.0) {
++				return true;
++			}
++		}
++		return false;
++	}
++
+ 	/**
+ 	 * Skyrim's NPCs press pressure plates and trip tripwires. Their stand-ins are placed, not moved
+ 	 * (no physics), so Minecraft never checks what they step into; do it for those blocks here.
+@@ -174,11 +245,11 @@ public final class SkyCombat {
+ 	}
+ 
+ 	private static void removeAll() {
+-		if (PROXIES.isEmpty()) {
++		if (OWNERS.isEmpty()) {
+ 			return;
+ 		}
+-		PROXIES.values().forEach(Entity::discard);
+-		PROXIES.clear();
++		OWNERS.values().forEach(m -> m.values().forEach(Entity::discard));
++		OWNERS.clear();
+ 	}
+ 
+ 	/**
+@@ -186,11 +257,21 @@ public final class SkyCombat {
+ 	 * {@code skyrimDamage} is what Skyrim would have taken off the player's health.
+ 	 */
+ 	public static void hurtPlayer(ServerPlayer player, int kind, float skyrimDamage, int attackerFormId, int flags) {
++		hurtPlayer(player, kind, skyrimDamage, attackerFormId, flags, "");
++	}
++
++	/** {@code cause}: MarioCraft, how SM64 says this hit would kill ("was chomped by a Chain Chomp"), or empty. */
++	public static void hurtPlayer(ServerPlayer player, int kind, float skyrimDamage, int attackerFormId, int flags, String cause) {
+ 		if (!player.isAlive() || skyrimDamage <= 0.0F) {
+ 			return;
+ 		}
+ 		ServerLevel level = player.level();
+-		SkyrimActorEntity attacker = PROXIES.get(attackerFormId);
++		// The attacker is in the hurt player's own game (MarioCraft: a guest's enemies are theirs).
++		Map<Integer, SkyrimActorEntity> mine = OWNERS.get(dev.skycraft.net.SkyNet.isHost(player) ? HOST : player.getUUID());
++		SkyrimActorEntity attacker = mine != null ? mine.get(attackerFormId) : null;
++		if (attacker == null) {
++			attacker = proxy(attackerFormId);  // (the host's, when both play the same level)
++		}
+ 		if (attacker != null && attacker.distanceToSqr(player) > 24.0 * 24.0) {
+ 			attacker = null; // a guest's own NPC with the same form id as one of the host's
+ 		}
+@@ -204,7 +285,13 @@ public final class SkyCombat {
+ 		float damage = skyrimDamage / SKYRIM_TO_MC_DAMAGE;
+ 		float healthBefore = player.getHealth();
+ 		boolean blocking = player.isBlocking();
+-		boolean hurt = player.hurtServer(level, source, damage);
++		dev.skycraft.world.MarioLives.cause(player, cause);  // (if this hit finishes him, that's how)
++		boolean hurt;
++		try {
++			hurt = player.hurtServer(level, source, damage);
++		} finally {
++			dev.skycraft.world.MarioLives.cause(player, "");
++		}
+ 		trainDefence(player, damage, blocking && player.getHealth() >= healthBefore - 1.0E-3F);
+ 		SkyCraft.LOG.info("SkyCraft: Skyrim hit the player for {} ({} Minecraft): health {} -> {}{}", skyrimDamage, damage, healthBefore, player.getHealth(),
+ 			hurt ? "" : " (blocked/immune)");
+diff --git a/fabric/src/main/java/dev/skycraft/combat/SkyrimActorEntity.java b/fabric/src/main/java/dev/skycraft/combat/SkyrimActorEntity.java
+index 99b4d27..358c292 100644
+--- a/fabric/src/main/java/dev/skycraft/combat/SkyrimActorEntity.java
++++ b/fabric/src/main/java/dev/skycraft/combat/SkyrimActorEntity.java
+@@ -44,13 +44,31 @@ public class SkyrimActorEntity extends LivingEntity {
+ 		this.setNoGravity(true);
+ 		this.noPhysics = true;
+ 		this.setInvisible(true);
+-		this.setSilent(true);
++		// MarioCraft: not silent: a hit SM64 enemy makes Minecraft's hurt sound (getHurtSound).
+ 	}
+ 
+ 	public int formId() {
+ 		return this.entityData.get(FORM_ID);
+ 	}
+ 
++	// MarioCraft: an enemy (Goomba, Bob-omb, boss...) rather than a friend (Toad, sign): the mobs on
++	// the player's side go after it (MarioAllies).
++	private boolean hostile;
++
++	public boolean hostile() {
++		return this.hostile;
++	}
++
++	public void setHostile(boolean hostile) {
++		this.hostile = hostile;
++	}
++
++	@Override
++	public double getVisibilityPercent(ServerLevel level, @Nullable Entity looker) {
++		// Invisible only because SM64 draws the real enemy: mobs see it from the usual distance.
++		return 1.0;
++	}
++
+ 	public void setFormId(int formId) {
+ 		this.entityData.set(FORM_ID, formId);
+ 	}
+@@ -96,6 +114,11 @@ public class SkyrimActorEntity extends LivingEntity {
+ 			this.pendingFlags |= Proto.HIT_PROJECTILE;
+ 		}
+ 		this.pendingWeapon = weaponClass(source);
++		// MarioCraft: a mace swung while falling is its smash attack (MaceItem's own test).
++		if (this.pendingWeapon == Proto.WEAPON_MACE && source.getEntity() instanceof LivingEntity attacker
++			&& attacker.fallDistance > 1.5 && !attacker.isFallFlying()) {
++			this.pendingFlags |= Proto.HIT_SMASH;
++		}
+ 		if (source.is(net.minecraft.tags.DamageTypeTags.IS_FIRE)) {
+ 			this.pendingFlags |= Proto.HIT_FIRE;
+ 		}
+@@ -145,6 +168,9 @@ public class SkyrimActorEntity extends LivingEntity {
+ 		if (weapon.is(Items.TRIDENT)) {
+ 			return Proto.WEAPON_PIERCE;
+ 		}
++		if (weapon.is(Items.MACE)) {
++			return Proto.WEAPON_MACE;
++		}
+ 		return Proto.WEAPON_BLUNT;
+ 	}
+ 
+@@ -196,7 +222,8 @@ public class SkyrimActorEntity extends LivingEntity {
+ 
+ 	@Override
+ 	protected @Nullable SoundEvent getHurtSound(DamageSource source) {
+-		return null; // Skyrim plays the NPC's own pain sounds
++		// MarioCraft: Minecraft's mob hurt sound for an SM64 enemy (Skyrim played its NPCs' own).
++		return this.hostile ? net.minecraft.sounds.SoundEvents.GENERIC_HURT : null;
+ 	}
+ 
+ 	@Override
+diff --git a/fabric/src/main/java/dev/skycraft/link/Proto.java b/fabric/src/main/java/dev/skycraft/link/Proto.java
+index 26b7fe6..e361e45 100644
+--- a/fabric/src/main/java/dev/skycraft/link/Proto.java
++++ b/fabric/src/main/java/dev/skycraft/link/Proto.java
+@@ -11,8 +11,8 @@ public final class Proto {
+ 	public static final int VERSION = 11;
+ 	// A second client on the same PC (multiplayer testing) talks to its own stand-in Skyrim:
+ 	// -Dskycraft.link=Local\SkyCraft_guest (see tools/fake_guest.py).
+-	public static final String MAPPING_NAME = System.getProperty("skycraft.link", "Local\\SkyCraft_v1");
+-	public static final double UNITS_PER_BLOCK = 70.0;
++	public static final String MAPPING_NAME = System.getProperty("skycraft.link", "Local\\MarioCraft_v1");
++	public static final double UNITS_PER_BLOCK = 100.0; // MarioCraft: SM64 units (Skyrim's were 70)
+ 
+ 	public static final long OFF_HEADER = 0x0;
+ 	public static final long OFF_SKY_STATE = 0x100;
+@@ -35,11 +35,46 @@ public final class Proto {
+ 	public static final long OFF_WORLD_ENTITIES = 0x1C000;
+ 	public static final long OFF_RENDER_RING = OFF_OVERLAY_PIXELS + OVERLAY_SLOT_BYTES * OVERLAY_SLOTS;
+ 	public static final long RENDER_RING_BYTES = 64L << 20;
+-	public static final long MAPPING_BYTES = OFF_RENDER_RING + RENDER_RING_BYTES;
++	// MarioCraft: SM64's moving and solid objects, at the end of the mapping (SM64 writes them every
++	// game frame; client MovingSurfaces reads). Only there if H_FEATURES has FEATURE_MOVING.
++	public static final long OFF_MOVING = OFF_RENDER_RING + RENDER_RING_BYTES;
++	public static final long MOVING_BYTES = 256L << 10;
++	public static final long MAPPING_BYTES = OFF_MOVING + MOVING_BYTES;
++	public static final long H_FEATURES = 0x20;
++	public static final int FEATURE_MOVING = 1;
++	// MarioCraft: the multiplayer lobby block (client MarioLobby; SM64's mc_lobby.c), in the gap
++	// between the input ring and the actor table. Only there if H_FEATURES has FEATURE_LOBBY.
++	public static final int FEATURE_LOBBY = 2;
++	public static final long OFF_LOBBY = 0x11800;
++	public static final long LB_WANT_SEQ = 0x000, LB_WANT = 0x004, LB_WANT_ADDR = 0x008;
++	public static final long LB_STATE_SEQ = 0x200, LB_STATE = 0x204, LB_PLAYERS = 0x208, LB_LINK = 0x210;
++	public static final int LB_TEXT_BYTES = 256;
++	// The player's skin face for SM64's HUD (8x8 RGBA, r in the low byte), seqlocked.
++	public static final long LB_FACE_SEQ = 0x400, LB_FACE = 0x404;
++	// MarioCraft: the C418 track SM64 wants playing instead of its own music (mc_music.c), seqlocked:
++	// its name under minecraft:sounds/music/ ("game/sweden"), empty for none.
++	public static final long LB_MUSIC_SEQ = 0x600, LB_MUSIC = 0x604;
++	public static final int LB_MUSIC_BYTES = 64;
++	public static final int LB_WANT_NOTHING = 0, LB_WANT_OWN_WORLD = 1, LB_WANT_HOST = 2, LB_WANT_JOIN = 3;
++	public static final int LB_WORLD_NONE = 0, LB_WORLD_OWN = 1, LB_WORLD_HOSTING = 2, LB_WORLD_FRIEND = 3;
++	public static final long MV_SEQ = 0x00, MV_NUM_OBJECTS = 0x04, MV_NUM_TRIS = 0x08, MV_WORLD_ID = 0x0C, MV_ORIGIN_X = 0x10, MV_SHIFT_Y = 0x18, MV_FRAME = 0x1C;
++	public static final long MV_OBJECTS = 0x40, MV_TRIS = 0x6000;
++	public static final int MV_MAX_OBJECTS = 256, MV_MAX_TRIS = 4096;
+ 
+ 	// Input types added in v5
+ 	public static final int IN_HURT = 7;
+ 	public static final int IN_OPEN_MENU = 8;
++	// MarioCraft: set the player's velocity (a, b, c: blocks per tick x 10000), e.g. letting go
++	// of something SM64 was carrying them on in mid-air.
++	public static final int IN_VELOCITY = 20;
++	// MarioCraft: SM64 healed the player (a: Minecraft health x 100), from a heart or coins.
++	public static final int IN_HEAL = 21;
++	// MarioCraft: play one of Minecraft's sounds for something SM64 did (code: SOUND_* below).
++	public static final int IN_SOUND = 22;
++	// MarioCraft: how the next IN_HURT would kill the player ("was chomped by a Chain Chomp"), in up
++	// to 4 parts (code: part number) of 12 bytes of text (a, b, c), before that IN_HURT.
++	public static final int IN_HURT_CAUSE = 23;
++	public static final int SOUND_POUND = 1, SOUND_BURN = 2, SOUND_PICKUP = 3, SOUND_THROW = 4, SOUND_CRUSH = 5;
+ 	public static final int HURT_MELEE = 0;
+ 	public static final int HURT_PROJECTILE = 1;
+ 	public static final int HURT_MAGIC = 2;
+@@ -84,6 +119,9 @@ public final class Proto {
+ 	public static final int WEAPON_BLUNT = 3;
+ 	public static final int WEAPON_PIERCE = 4;
+ 	public static final int WEAPON_ARROW = 5;
++	// MarioCraft: a mace; HIT_SMASH: its smash attack (swung while falling, Minecraft's own rule).
++	public static final int WEAPON_MACE = 6;
++	public static final int HIT_SMASH = 1 << 4;
+ 
+ 	// World entities (relative to OFF_WORLD_ENTITIES)
+ 	public static final int MAX_WORLD_ENTITIES = 160;
+@@ -148,6 +186,19 @@ public final class Proto {
+ 	public static final int SKY_IN_GAME = 1;
+ 	public static final int SKY_MENU_OPEN = 1 << 1;
+ 	public static final int SKY_LOADING = 1 << 2;
++	// MarioCraft: SM64 is in charge of where the player is; follow its position every tick.
++	public static final int SKY_PUPPET = 1 << 3;
++	// MarioCraft: Mario has the wing cap, so the player may fly (creative-style) until it runs out.
++	public static final int SKY_WING_CAP = 1 << 4;
++	// MarioCraft: export the player's body even in first person (SM64 is showing a cutscene).
++	public static final int SKY_SHOW_BODY = 1 << 5;
++	// MarioCraft: Mario's metal / vanish cap is on: the player gets Minecraft effects for it (MarioCaps).
++	public static final int SKY_METAL_CAP = 1 << 6;
++	public static final int SKY_VANISH_CAP = 1 << 7;
++	/** MarioCraft: SM64 is sliding the player down a slide (a puppet): draw them sitting. */
++	public static final int SKY_SLIDING = 1 << 8;
++	/** MarioCraft: an underwater level: the player breathes in its water (MarioCaps). */
++	public static final int SKY_WATER_LEVEL = 1 << 9;
+ 
+ 	// McState (relative to OFF_MC_STATE)
+ 	public static final long MS_SEQ = 0x00;
+@@ -189,6 +240,8 @@ public final class Proto {
+ 	public static final int MC_DEAD = 1 << 5;
+ 	public static final int MC_SWIMMING = 1 << 6;
+ 	public static final int MC_FLYING = 1 << 7;
++	// MarioCraft: in water or lava, or on a ladder or vines (no Mario jumps there).
++	public static final int MC_IN_FLUID = 1 << 8;
+ 
+ 	// Overlay
+ 	public static final long OC_STATE = 0x00;
+@@ -226,11 +279,28 @@ public final class Proto {
+ 	public static final int TRI_DIGGABLE = 2;
+ 	public static final int TRI_GHOST = 4;
+ 	public static final int TRI_TERRAIN = 8;
++	// MarioCraft: a floor SM64 lets Mario walk up (stairs are steep "not slippery" ramps): walkable
++	// whatever its slope.
++	public static final int TRI_WALKABLE = 16;
+ 	public static final int TRI_MATERIAL_SHIFT = 8;
+ 	// DigMaterial (skycraft_protocol.h)
+ 	public static final int DIG_NONE = 0, DIG_GRASS = 1, DIG_DIRT = 2, DIG_STONE = 3, DIG_COBBLE = 4, DIG_SNOW = 5, DIG_ICE = 6, DIG_SAND = 7,
+ 		DIG_GRAVEL = 8, DIG_MUD = 9, DIG_OAK_LOG = 10, DIG_SPRUCE_LOG = 11, DIG_BIRCH_LOG = 12, DIG_PLANKS = 13, DIG_METAL = 14, DIG_GLASS = 15,
+-		DIG_ORGANIC = 16, DIG_CLOTH = 17, DIG_BONE = 18, DIG_WEB = 19, DIG_ASH = 20, DIG_BEDROCK = 21, DIG_MATERIAL_COUNT = 22;
++		DIG_ORGANIC = 16, DIG_CLOTH = 17, DIG_BONE = 18, DIG_WEB = 19, DIG_ASH = 20, DIG_BEDROCK = 21,
++		// MarioCraft: what SM64's levels are made of besides
++		DIG_BRICKS = 22, DIG_RED_WOOL = 23,
++		// MarioCraft: the blocks SM64's level textures stand for (mc_material.c's sNamed table)
++		DIG_STONE_BRICKS = 24, DIG_MOSSY_STONE_BRICKS = 25, DIG_SMOOTH_STONE = 26, DIG_QUARTZ = 27, DIG_QUARTZ_BRICKS = 28,
++		DIG_QUARTZ_PILLAR = 29, DIG_SANDSTONE = 30, DIG_SMOOTH_SANDSTONE = 31, DIG_CUT_SANDSTONE = 32, DIG_OAK_PLANKS = 33,
++		DIG_DARK_OAK_PLANKS = 34, DIG_BIRCH_PLANKS = 35, DIG_OAK_FENCE = 36, DIG_IRON_BARS = 37, DIG_TILES = 38,
++		DIG_GREEN_WOOL = 39, DIG_GOLD = 40, DIG_IRON = 41, DIG_COPPER = 42, DIG_TERRACOTTA = 43, DIG_RED_TERRACOTTA = 44,
++		DIG_GRANITE = 45, DIG_ANDESITE = 46, DIG_DIORITE = 47, DIG_POLISHED_ANDESITE = 48, DIG_MOSSY_COBBLE = 49,
++		DIG_COARSE_DIRT = 50, DIG_MUSHROOM = 51, DIG_BLUE_ICE = 52, DIG_PRISMARINE = 53, DIG_DARK_PRISMARINE = 54,
++		DIG_BOOKSHELF = 55, DIG_GLOWSTONE = 56, DIG_NETHERRACK = 57, DIG_BLACKSTONE = 58, DIG_MAGMA = 59,
++		DIG_DEEPSLATE = 60, DIG_DEEPSLATE_TILES = 61, DIG_DRIPSTONE = 62, DIG_CHISELED_STONE_BRICKS = 63, DIG_LAPIS = 64,
++		DIG_YELLOW_WOOL = 65, DIG_GREEN_TERRACOTTA = 66, DIG_WHITE_TERRACOTTA = 67, DIG_WHITE_WOOL = 68,
++		DIG_RED_SANDSTONE = 69, DIG_POLISHED_BLACKSTONE = 70, DIG_PACKED_ICE = 71,
++		DIG_MATERIAL_COUNT = 72;
+ 	public static final int COL_REGION_HEADER_BYTES = 32;
+ 	public static final int COL_BLOCK_BYTES = 80;
+ }
+diff --git a/fabric/src/main/java/dev/skycraft/link/SkyLink.java b/fabric/src/main/java/dev/skycraft/link/SkyLink.java
+index 6b9b166..ab5ace8 100644
+--- a/fabric/src/main/java/dev/skycraft/link/SkyLink.java
++++ b/fabric/src/main/java/dev/skycraft/link/SkyLink.java
+@@ -214,6 +214,16 @@ public final class SkyLink {
+ 		public boolean loading() {
+ 			return (this.flags & SKY_LOADING) != 0;
+ 		}
++
++		/** MarioCraft: the player is a puppet that follows Mario. */
++		public boolean puppet() {
++			return (this.flags & SKY_PUPPET) != 0;
++		}
++
++		/** MarioCraft: sliding down a slide on his backside, like Mario: he's drawn sitting. */
++		public boolean sliding() {
++			return (this.flags & Proto.SKY_SLIDING) != 0;
++		}
+ 	}
+ 
+ 	/** Seqlock read of SkyState into {@code out}. Returns false if the link is down. */
+diff --git a/fabric/src/main/java/dev/skycraft/mixin/MobGoalsAccessor.java b/fabric/src/main/java/dev/skycraft/mixin/MobGoalsAccessor.java
+new file mode 100644
+index 0000000..74b79f8
+--- /dev/null
++++ b/fabric/src/main/java/dev/skycraft/mixin/MobGoalsAccessor.java
+@@ -0,0 +1,16 @@
++package dev.skycraft.mixin;
++
++import net.minecraft.world.entity.Mob;
++import net.minecraft.world.entity.ai.goal.GoalSelector;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.gen.Accessor;
++
++/** MarioCraft (MarioAllies): a mob's goals and what it targets. */
++@Mixin(Mob.class)
++public interface MobGoalsAccessor {
++	@Accessor("goalSelector")
++	GoalSelector skycraft$goals();
++
++	@Accessor("targetSelector")
++	GoalSelector skycraft$targets();
++}
+diff --git a/fabric/src/main/java/dev/skycraft/mixin/MobNoPlayerTargetMixin.java b/fabric/src/main/java/dev/skycraft/mixin/MobNoPlayerTargetMixin.java
+new file mode 100644
+index 0000000..66f97e4
+--- /dev/null
++++ b/fabric/src/main/java/dev/skycraft/mixin/MobNoPlayerTargetMixin.java
+@@ -0,0 +1,22 @@
++package dev.skycraft.mixin;
++
++import dev.skycraft.link.SkyLink;
++import dev.skycraft.world.MarioAllies;
++import net.minecraft.world.entity.LivingEntity;
++import net.minecraft.world.entity.Mob;
++import net.minecraft.world.entity.player.Player;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.ModifyVariable;
++
++/** MarioCraft: a hostile mob never takes a player as its target (MarioAllies), whatever goal picked them. */
++@Mixin(Mob.class)
++public abstract class MobNoPlayerTargetMixin {
++	@ModifyVariable(method = "setTarget", at = @At("HEAD"), argsOnly = true)
++	private LivingEntity skycraft$notPlayers(LivingEntity target) {
++		if (target instanceof Player && SkyLink.active() && MarioAllies.hostile((Mob) (Object) this)) {
++			return null;
++		}
++		return target;
++	}
++}
+diff --git a/fabric/src/main/java/dev/skycraft/mixin/NearestAttackableTargetGoalAccessor.java b/fabric/src/main/java/dev/skycraft/mixin/NearestAttackableTargetGoalAccessor.java
+new file mode 100644
+index 0000000..b455f82
+--- /dev/null
++++ b/fabric/src/main/java/dev/skycraft/mixin/NearestAttackableTargetGoalAccessor.java
+@@ -0,0 +1,13 @@
++package dev.skycraft.mixin;
++
++import net.minecraft.world.entity.LivingEntity;
++import net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.gen.Accessor;
++
++/** MarioCraft (MarioAllies): what kind of target a mob's "attack the nearest ..." goal is after. */
++@Mixin(NearestAttackableTargetGoal.class)
++public interface NearestAttackableTargetGoalAccessor {
++	@Accessor("targetType")
++	Class<? extends LivingEntity> skycraft$targetType();
++}
+diff --git a/fabric/src/main/java/dev/skycraft/mixin/PlayerFallMixin.java b/fabric/src/main/java/dev/skycraft/mixin/PlayerFallMixin.java
+new file mode 100644
+index 0000000..58c9bab
+--- /dev/null
++++ b/fabric/src/main/java/dev/skycraft/mixin/PlayerFallMixin.java
+@@ -0,0 +1,38 @@
++package dev.skycraft.mixin;
++
++import dev.skycraft.link.SkyLink;
++import dev.skycraft.world.MarioFalls;
++import net.minecraft.server.level.ServerPlayer;
++import net.minecraft.world.damagesource.DamageSource;
++import net.minecraft.world.entity.player.Player;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.ModifyVariable;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
++
++/**
++ * MarioCraft: Minecraft's fall damage as usual, except for the landing after SM64 put the player
++ * somewhere or let go of them (MarioFalls): loading into a level must not hurt. And the extra
++ * height of one of Mario's jumps doesn't count.
++ */
++@Mixin(Player.class)
++public abstract class PlayerFallMixin {
++	@Inject(method = "causeFallDamage", at = @At("HEAD"), cancellable = true)
++	private void skycraft$safeLanding(double fallDistance, float multiplier, DamageSource source, CallbackInfoReturnable<Boolean> cir) {
++		if ((Object) this instanceof ServerPlayer player && SkyLink.active() && MarioFalls.takeSafe(player)) {
++			player.resetFallDistance();
++			cir.setReturnValue(false);
++		}
++	}
++
++	@ModifyVariable(method = "causeFallDamage", at = @At("HEAD"), argsOnly = true)
++	private double skycraft$marioJump(double fallDistance) {
++		if ((Object) this instanceof ServerPlayer player && SkyLink.active()) {
++			// Mario never dies of a fall (the worst costs him 3 of his 8 wedges), and some stars are
++			// down long drops: Minecraft's fall damage, but never more than 6 hearts at once.
++			return Math.min(MarioFalls.takeJumpBonus(player, fallDistance), 15.0);
++		}
++		return fallDistance;
++	}
++}
+diff --git a/fabric/src/main/java/dev/skycraft/mixin/PlayerHostileDamageMixin.java b/fabric/src/main/java/dev/skycraft/mixin/PlayerHostileDamageMixin.java
+new file mode 100644
+index 0000000..e58a4ff
+--- /dev/null
++++ b/fabric/src/main/java/dev/skycraft/mixin/PlayerHostileDamageMixin.java
+@@ -0,0 +1,24 @@
++package dev.skycraft.mixin;
++
++import dev.skycraft.world.MarioAllies;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.damagesource.DamageSource;
++import net.minecraft.world.entity.player.Player;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
++
++/**
++ * MarioCraft: hostile mobs are on the players' side (MarioAllies): a creeper going off by a Goomba,
++ * a Wither skull, a slime's touch or a stray arrow doesn't hurt Steve.
++ */
++@Mixin(Player.class)
++public abstract class PlayerHostileDamageMixin {
++	@Inject(method = "hurtServer", at = @At("HEAD"), cancellable = true)
++	private void skycraft$alliesDontHurt(ServerLevel level, DamageSource source, float amount, CallbackInfoReturnable<Boolean> cir) {
++		if (MarioAllies.fromHostile(source)) {
++			cir.setReturnValue(false);
++		}
++	}
++}
+diff --git a/fabric/src/main/java/dev/skycraft/mixin/ServerExplosionMixin.java b/fabric/src/main/java/dev/skycraft/mixin/ServerExplosionMixin.java
+index be1a22a..99291ba 100644
+--- a/fabric/src/main/java/dev/skycraft/mixin/ServerExplosionMixin.java
++++ b/fabric/src/main/java/dev/skycraft/mixin/ServerExplosionMixin.java
+@@ -72,5 +72,24 @@ public abstract class ServerExplosionMixin {
+ 		ServerExplosion self = (ServerExplosion) (Object) this;
+ 		var center = self.center();
+ 		SkyLink.pushEvent(Proto.EV_EXPLOSION, 0, (float) center.x, (float) center.y, (float) center.z, self.radius(), 0);
++		// MarioCraft: guests' SM64 enemies too, for guests in another level than the host (in the
++		// same one, the host's SM64 already hit them, and SM64-coop shares that).
++		var server = self.level().getServer();
++		if (server != null) {
++			net.minecraft.server.level.ServerPlayer host = null;
++			for (var p : server.getPlayerList().getPlayers()) {
++				if (dev.skycraft.net.SkyNet.isHost(p)) {
++					host = p;
++				}
++			}
++			for (var p : server.getPlayerList().getPlayers()) {
++				if (dev.skycraft.net.SkyNet.isHost(p) || p.distanceToSqr(center) > 96.0 * 96.0
++					|| (host != null && host.distanceToSqr(center) < 96.0 * 96.0)) {
++					continue;
++				}
++				net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.send(p,
++					new dev.skycraft.net.SkyNet.Explosion((float) center.x, (float) center.y, (float) center.z, self.radius()));
++			}
++		}
+ 	}
+ }
+diff --git a/fabric/src/main/java/dev/skycraft/mixin/SupportBlocksMixin.java b/fabric/src/main/java/dev/skycraft/mixin/SupportBlocksMixin.java
+new file mode 100644
+index 0000000..500aab7
+--- /dev/null
++++ b/fabric/src/main/java/dev/skycraft/mixin/SupportBlocksMixin.java
+@@ -0,0 +1,23 @@
++package dev.skycraft.mixin;
++
++import dev.skycraft.link.SkyLink;
++import net.minecraft.server.network.ServerGamePacketListenerImpl;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++/**
++ * MarioCraft: players stand on SM64's ground, which isn't blocks. Minecraft took that for a client
++ * out of step ("standing on air") and re-sent every block under the player every 10 seconds: the
++ * client re-meshed those chunks and SM64 got all of them again, a stutter each time.
++ */
++@Mixin(ServerGamePacketListenerImpl.class)
++public abstract class SupportBlocksMixin {
++	@Inject(method = "forceSendPlayerSupportBlocks", at = @At("HEAD"), cancellable = true)
++	private void skycraft$sm64GroundIsSupport(CallbackInfo ci) {
++		if (SkyLink.active()) {
++			ci.cancel();
++		}
++	}
++}
+diff --git a/fabric/src/main/java/dev/skycraft/mixin/WalkNodeEvaluatorMixin.java b/fabric/src/main/java/dev/skycraft/mixin/WalkNodeEvaluatorMixin.java
+new file mode 100644
+index 0000000..d03f258
+--- /dev/null
++++ b/fabric/src/main/java/dev/skycraft/mixin/WalkNodeEvaluatorMixin.java
+@@ -0,0 +1,27 @@
++package dev.skycraft.mixin;
++
++import dev.skycraft.world.SkyCollision;
++import net.minecraft.core.BlockPos;
++import net.minecraft.world.level.BlockGetter;
++import net.minecraft.world.level.pathfinder.PathType;
++import net.minecraft.world.level.pathfinder.WalkNodeEvaluator;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
++
++/**
++ * MarioCraft: mobs find their way over SM64's ground. Minecraft's path finder only looks at blocks,
++ * and Mario's level isn't blocks, so every cell looked like open air and mobs couldn't plan a route.
++ * A cell holding SM64 geometry now counts as solid, so the cell above it is somewhere to walk.
++ * (Optional: if a Minecraft update renames this method, mobs just path less cleverly.)
++ */
++@Mixin(WalkNodeEvaluator.class)
++public abstract class WalkNodeEvaluatorMixin {
++	@Inject(method = "getPathTypeFromState", at = @At("HEAD"), cancellable = true, require = 0)
++	private static void mariocraft$sm64GroundIsSolid(BlockGetter level, BlockPos pos, CallbackInfoReturnable<PathType> cir) {
++		if (level.getBlockState(pos).isAir() && SkyCollision.hasGeometry(pos)) {
++			cir.setReturnValue(PathType.BLOCKED);
++		}
++	}
++}
+diff --git a/fabric/src/main/java/dev/skycraft/mixin/WitherHeadsMixin.java b/fabric/src/main/java/dev/skycraft/mixin/WitherHeadsMixin.java
+new file mode 100644
+index 0000000..68c75b4
+--- /dev/null
++++ b/fabric/src/main/java/dev/skycraft/mixin/WitherHeadsMixin.java
+@@ -0,0 +1,24 @@
++package dev.skycraft.mixin;
++
++import dev.skycraft.link.SkyLink;
++import net.minecraft.world.entity.boss.wither.WitherBoss;
++import dev.skycraft.combat.SkyrimActorEntity;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.ModifyVariable;
++
++/**
++ * MarioCraft: the Wither's two side heads pick their own targets (any living thing near, not
++ * through setTarget): never a player. They go for SM64's enemies' stand-ins instead.
++ */
++@Mixin(WitherBoss.class)
++public abstract class WitherHeadsMixin {
++	@ModifyVariable(method = "setAlternativeTarget", at = @At("HEAD"), argsOnly = true, ordinal = 1)
++	private int skycraft$notPlayers(int entityId) {
++		if (entityId != 0 && SkyLink.active()
++			&& !(((WitherBoss) (Object) this).level().getEntity(entityId) instanceof SkyrimActorEntity actor && actor.hostile())) {
++			return 0;  // (players, and Minecraft's own animals: only SM64's enemies)
++		}
++		return entityId;
++	}
++}
+diff --git a/fabric/src/main/java/dev/skycraft/net/SkyNet.java b/fabric/src/main/java/dev/skycraft/net/SkyNet.java
+index 1e79459..5d15746 100644
+--- a/fabric/src/main/java/dev/skycraft/net/SkyNet.java
++++ b/fabric/src/main/java/dev/skycraft/net/SkyNet.java
+@@ -24,13 +24,14 @@ public final class SkyNet {
+ 	}
+ 
+ 	/** Guest -> server: the guest's Skyrim hit them (as proto::InputEvent kInHurt). */
+-	public record Hurt(int kind, float skyrimDamage, int attackerFormId, int flags) implements CustomPacketPayload {
++	public record Hurt(int kind, float skyrimDamage, int attackerFormId, int flags, String cause) implements CustomPacketPayload {
+ 		public static final Type<Hurt> TYPE = new Type<>(Identifier.fromNamespaceAndPath(SkyCraft.MOD_ID, "hurt"));
+ 		public static final StreamCodec<RegistryFriendlyByteBuf, Hurt> CODEC = StreamCodec.composite(
+ 			ByteBufCodecs.VAR_INT, Hurt::kind,
+ 			ByteBufCodecs.FLOAT, Hurt::skyrimDamage,
+ 			ByteBufCodecs.INT, Hurt::attackerFormId,
+ 			ByteBufCodecs.VAR_INT, Hurt::flags,
++			ByteBufCodecs.stringUtf8(64), Hurt::cause,
+ 			Hurt::new
+ 		);
+ 
+@@ -83,7 +84,197 @@ public final class SkyNet {
+ 		}
+ 	}
+ 
++	/** MarioCraft: one of a guest's SM64 enemies (SkyLink.Actor's essentials). */
++	public record GuestActor(int formId, int flags, float x, float y, float z, float yaw, float width, float height, String name) {
++		public static final StreamCodec<RegistryFriendlyByteBuf, GuestActor> CODEC = StreamCodec.composite(
++			ByteBufCodecs.VAR_INT, GuestActor::formId,
++			ByteBufCodecs.VAR_INT, GuestActor::flags,
++			ByteBufCodecs.FLOAT, GuestActor::x,
++			ByteBufCodecs.FLOAT, GuestActor::y,
++			ByteBufCodecs.FLOAT, GuestActor::z,
++			ByteBufCodecs.FLOAT, GuestActor::yaw,
++			ByteBufCodecs.FLOAT, GuestActor::width,
++			ByteBufCodecs.FLOAT, GuestActor::height,
++			ByteBufCodecs.stringUtf8(32), GuestActor::name,
++			GuestActor::new
++		);
++	}
++
++	/**
++	 * MarioCraft, guest -> server: the enemies around them in their own SM64 (which can be in another
++	 * level than the host's), so the server has stand-ins for them to hit (SkyCombat).
++	 */
++	public record GuestActors(List<GuestActor> actors) implements CustomPacketPayload {
++		public static final Type<GuestActors> TYPE = new Type<>(Identifier.fromNamespaceAndPath(SkyCraft.MOD_ID, "guest_actors"));
++		public static final StreamCodec<RegistryFriendlyByteBuf, GuestActors> CODEC = StreamCodec.composite(
++			GuestActor.CODEC.apply(ByteBufCodecs.list(64)), GuestActors::actors, GuestActors::new);
++
++		@Override
++		public Type<? extends CustomPacketPayload> type() {
++			return TYPE;
++		}
++	}
++
++	/** MarioCraft, server -> guest: one of their enemies' stand-ins was hit (as Proto.EV_HIT_ACTOR). */
++	public record HitActor(int formId, float damage, float pushX, float pushZ, float push, int flags, int weapon) implements CustomPacketPayload {
++		public static final Type<HitActor> TYPE = new Type<>(Identifier.fromNamespaceAndPath(SkyCraft.MOD_ID, "hit_actor"));
++		public static final StreamCodec<RegistryFriendlyByteBuf, HitActor> CODEC = StreamCodec.composite(
++			ByteBufCodecs.VAR_INT, HitActor::formId,
++			ByteBufCodecs.FLOAT, HitActor::damage,
++			ByteBufCodecs.FLOAT, HitActor::pushX,
++			ByteBufCodecs.FLOAT, HitActor::pushZ,
++			ByteBufCodecs.FLOAT, HitActor::push,
++			ByteBufCodecs.INT, HitActor::flags,
++			ByteBufCodecs.VAR_INT, HitActor::weapon,
++			HitActor::new
++		);
++
++		@Override
++		public Type<? extends CustomPacketPayload> type() {
++			return TYPE;
++		}
++	}
++
++	/** MarioCraft, server -> guest: an explosion went off (as Proto.EV_EXPLOSION): it hits their SM64 enemies too. */
++	public record Explosion(float x, float y, float z, float radius) implements CustomPacketPayload {
++		public static final Type<Explosion> TYPE = new Type<>(Identifier.fromNamespaceAndPath(SkyCraft.MOD_ID, "explosion"));
++		public static final StreamCodec<RegistryFriendlyByteBuf, Explosion> CODEC = StreamCodec.composite(
++			ByteBufCodecs.FLOAT, Explosion::x,
++			ByteBufCodecs.FLOAT, Explosion::y,
++			ByteBufCodecs.FLOAT, Explosion::z,
++			ByteBufCodecs.FLOAT, Explosion::radius,
++			Explosion::new
++		);
++
++		@Override
++		public Type<? extends CustomPacketPayload> type() {
++			return TYPE;
++		}
++	}
++
++	/** MarioCraft, guest -> server: which of Mario's caps they have on (Proto.SKY_*_CAP): Minecraft effects. */
++	public record Caps(int mask) implements CustomPacketPayload {
++		public static final Type<Caps> TYPE = new Type<>(Identifier.fromNamespaceAndPath(SkyCraft.MOD_ID, "caps"));
++		public static final StreamCodec<RegistryFriendlyByteBuf, Caps> CODEC = StreamCodec.composite(ByteBufCodecs.VAR_INT, Caps::mask, Caps::new);
++
++		@Override
++		public Type<? extends CustomPacketPayload> type() {
++			return TYPE;
++		}
++	}
++
++	/** MarioCraft, guest -> server: SM64 healed them (a heart, coins), in Minecraft health. */
++	public record Heal(float amount) implements CustomPacketPayload {
++		public static final Type<Heal> TYPE = new Type<>(Identifier.fromNamespaceAndPath(SkyCraft.MOD_ID, "heal"));
++		public static final StreamCodec<RegistryFriendlyByteBuf, Heal> CODEC = StreamCodec.composite(ByteBufCodecs.FLOAT, Heal::amount, Heal::new);
++
++		@Override
++		public Type<? extends CustomPacketPayload> type() {
++			return TYPE;
++		}
++	}
++
++	/** MarioCraft, guest -> server: SM64 just put them somewhere (a level, a warp) or let go of them: their next landing doesn't hurt. */
++	public record SafeLanding(int unused) implements CustomPacketPayload {
++		public static final Type<SafeLanding> TYPE = new Type<>(Identifier.fromNamespaceAndPath(SkyCraft.MOD_ID, "safe_landing"));
++		public static final StreamCodec<RegistryFriendlyByteBuf, SafeLanding> CODEC = StreamCodec.composite(ByteBufCodecs.VAR_INT, SafeLanding::unused, SafeLanding::new);
++
++		@Override
++		public Type<? extends CustomPacketPayload> type() {
++			return TYPE;
++		}
++	}
++
++	/**
++	 * MarioCraft, guest -> server: a piece of one of their SM64 level's collision messages
++	 * (SkyCollision.ingestGuest), so items and mobs near a guest in another level stand on it. A
++	 * message bigger than a packet comes in parts.
++	 */
++	public record GuestShape(int msgId, int part, int total, byte[] data) implements CustomPacketPayload {
++		public static final int PART_BYTES = 24 * 1024;
++		public static final Type<GuestShape> TYPE = new Type<>(Identifier.fromNamespaceAndPath(SkyCraft.MOD_ID, "guest_shape"));
++		public static final StreamCodec<RegistryFriendlyByteBuf, GuestShape> CODEC = StreamCodec.composite(
++			ByteBufCodecs.VAR_INT, GuestShape::msgId,
++			ByteBufCodecs.VAR_INT, GuestShape::part,
++			ByteBufCodecs.VAR_INT, GuestShape::total,
++			ByteBufCodecs.byteArray(PART_BYTES), GuestShape::data,
++			GuestShape::new
++		);
++
++		@Override
++		public Type<? extends CustomPacketPayload> type() {
++			return TYPE;
++		}
++	}
++
++	/** A guest's message being put back together (server thread only). */
++	private static final class Assembly {
++		int msgId = -1;
++		int next;
++		java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
++	}
++
++	private static final java.util.Map<java.util.UUID, Assembly> ASSEMBLIES = new java.util.HashMap<>();
++
++	private static void guestShape(ServerPlayer player, GuestShape p) {
++		Assembly a = ASSEMBLIES.computeIfAbsent(player.getUUID(), u -> new Assembly());
++		if (p.part() == 0) {
++			a.msgId = p.msgId();
++			a.next = 0;
++			a.bytes.reset();
++		}
++		if (p.msgId() != a.msgId || p.part() != a.next || p.total() < 1 || p.total() > 256) {
++			a.msgId = -1;  // a part went missing: drop the message
++			return;
++		}
++		a.bytes.writeBytes(p.data());
++		a.next++;
++		if (a.next == p.total()) {
++			byte[] msg = a.bytes.toByteArray();
++			a.msgId = -1;
++			a.bytes.reset();
++			dev.skycraft.world.SkyCollision.ingestGuest(msg);
++		}
++	}
++
+ 	public static void init() {
++		PayloadTypeRegistry.serverboundPlay().register(GuestShape.TYPE, GuestShape.CODEC);
++		ServerPlayNetworking.registerGlobalReceiver(GuestShape.TYPE, (payload, context) -> {
++			ServerPlayer player = context.player();
++			context.server().execute(() -> guestShape(player, payload));
++		});
++		PayloadTypeRegistry.serverboundPlay().register(GuestActors.TYPE, GuestActors.CODEC);
++		PayloadTypeRegistry.clientboundPlay().register(HitActor.TYPE, HitActor.CODEC);
++		PayloadTypeRegistry.clientboundPlay().register(Explosion.TYPE, Explosion.CODEC);
++		ServerPlayNetworking.registerGlobalReceiver(GuestActors.TYPE, (payload, context) -> {
++			ServerPlayer player = context.player();
++			List<GuestActor> actors = List.copyOf(payload.actors());
++			context.server().execute(() -> SkyCombat.guestActors(player, actors));
++		});
++		PayloadTypeRegistry.serverboundPlay().register(Caps.TYPE, Caps.CODEC);
++		ServerPlayNetworking.registerGlobalReceiver(Caps.TYPE, (payload, context) -> {
++			ServerPlayer player = context.player();
++			context.server().execute(() -> dev.skycraft.world.MarioFalls.capEffects(player, payload.mask()));
++		});
++		PayloadTypeRegistry.serverboundPlay().register(Heal.TYPE, Heal.CODEC);
++		PayloadTypeRegistry.serverboundPlay().register(SafeLanding.TYPE, SafeLanding.CODEC);
++		ServerPlayNetworking.registerGlobalReceiver(Heal.TYPE, (payload, context) -> {
++			ServerPlayer player = context.player();
++			float amount = Math.max(0.0F, Math.min(payload.amount(), 20.0F)); // (friends only, but still)
++			context.server().execute(() -> dev.skycraft.world.MarioFalls.marioHeal(player, amount));
++		});
++		ServerPlayNetworking.registerGlobalReceiver(SafeLanding.TYPE, (payload, context) -> {
++			ServerPlayer player = context.player();
++			// 0: a safe landing; more: one of Mario's jumps, its extra height in hundredths of a block.
++			int jump = payload.unused();
++			context.server().execute(() -> {
++				if (jump > 0) {
++					dev.skycraft.world.MarioFalls.markJump(player, jump / 100.0F);
++				} else {
++					dev.skycraft.world.MarioFalls.markSafe(player);
++				}
++			});
++		});
+ 		PayloadTypeRegistry.serverboundPlay().register(Hurt.TYPE, Hurt.CODEC);
+ 		PayloadTypeRegistry.serverboundPlay().register(DigOpen.TYPE, DigOpen.CODEC);
+ 		PayloadTypeRegistry.serverboundPlay().register(DigReveal.TYPE, DigReveal.CODEC);
+@@ -101,7 +292,7 @@ public final class SkyNet {
+ 			ServerPlayer player = context.player();
+ 			// A hit's worth of damage, whatever the guest's client claims (friends only, but still).
+ 			float damage = Math.max(0.0F, Math.min(payload.skyrimDamage(), 10000.0F));
+-			context.server().execute(() -> SkyCombat.hurtPlayer(player, payload.kind(), damage, payload.attackerFormId(), payload.flags()));
++			context.server().execute(() -> SkyCombat.hurtPlayer(player, payload.kind(), damage, payload.attackerFormId(), payload.flags(), payload.cause()));
+ 		});
+ 	}
+ 
+diff --git a/fabric/src/main/java/dev/skycraft/world/MarioAllies.java b/fabric/src/main/java/dev/skycraft/world/MarioAllies.java
+new file mode 100644
+index 0000000..6a9ee7d
+--- /dev/null
++++ b/fabric/src/main/java/dev/skycraft/world/MarioAllies.java
+@@ -0,0 +1,131 @@
++package dev.skycraft.world;
++
++import dev.skycraft.SkyCraft;
++import dev.skycraft.combat.SkyrimActorEntity;
++import dev.skycraft.link.SkyLink;
++import dev.skycraft.mixin.MobGoalsAccessor;
++import dev.skycraft.mixin.NearestAttackableTargetGoalAccessor;
++import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
++import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.world.damagesource.DamageSource;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.entity.Mob;
++import net.minecraft.world.entity.NeutralMob;
++import net.minecraft.world.entity.ai.Brain;
++import net.minecraft.world.entity.ai.goal.target.HurtByTargetGoal;
++import net.minecraft.world.entity.ai.goal.target.NearestAttackableTargetGoal;
++import net.minecraft.world.entity.ai.memory.MemoryModuleType;
++import net.minecraft.world.entity.monster.Enemy;
++import net.minecraft.world.entity.player.Player;
++import org.jspecify.annotations.Nullable;
++
++/**
++ * MarioCraft: Minecraft's mobs fight for Steve. A mob spawned in Mario's world (spawn egg, /summon,
++ * a built Wither or Iron Golem...) stops going after players and goes after SM64's enemies instead:
++ * Goombas, Bob-ombs, Bullies, bosses. Their hits land on the enemies' stand-ins, which SM64 turns
++ * into Mario's attacks like Steve's own (mc_actors.c); creepers' and Withers' blasts hit them too.
++ * Mobs that can't attack (cows, sheep...) are left as they are. Hostile mobs never go after a player,
++ * not even one who hits them, and can't hurt one (MobNoPlayerTargetMixin, WitherHeadsMixin,
++ * PlayerHostileDamageMixin); neutral mobs still get angry at whoever hits them, as in
++ * Minecraft.
++ */
++public final class MarioAllies {
++	private static boolean logged;
++
++	private MarioAllies() {
++	}
++
++	public static void init() {
++		ServerEntityEvents.ENTITY_LOAD.register((entity, level) -> befriend(entity));
++		ServerTickEvents.END_SERVER_TICK.register(server -> {
++			if (++ticks % 5 != 0 || !SkyLink.active()) {
++				return;
++			}
++			for (ServerLevel level : server.getAllLevels()) {
++				for (Entity e : level.getAllEntities()) {
++					if (hostile(e)) {
++						forgetPlayers((Mob) e);
++					}
++				}
++			}
++		});
++	}
++
++	private static int ticks;
++
++	/**
++	 * A hostile mob (zombies, skeletons, creepers, the Wither...): in Mario's world it's on Steve's
++	 * side, never after players. Neutral mobs (wolves, golems, endermen, bees, zombified piglins...)
++	 * and peaceful ones are left as in Minecraft.
++	 */
++	public static boolean hostile(@Nullable Entity e) {
++		return e instanceof Mob && e instanceof Enemy && !(e instanceof NeutralMob) && !(e instanceof SkyrimActorEntity);
++	}
++
++	/** True if this damage comes from a hostile mob (or its arrow, skull, fireball, explosion). */
++	public static boolean fromHostile(DamageSource source) {
++		return SkyLink.active() && (hostile(source.getEntity()) || hostile(source.getDirectEntity()));
++	}
++
++	/** Mobs that think with a brain (piglin brutes, hoglins, zoglins, the warden...) don't use setTarget. */
++	private static void forgetPlayers(Mob mob) {
++		if (mob.getTarget() instanceof Player) {
++			mob.setTarget(null);
++		}
++		Brain<?> brain = mob.getBrain();
++		if (brain.hasMemoryValue(MemoryModuleType.ATTACK_TARGET) && brain.getMemory(MemoryModuleType.ATTACK_TARGET).orElse(null) instanceof Player) {
++			brain.eraseMemory(MemoryModuleType.ATTACK_TARGET);
++		}
++		if (brain.hasMemoryValue(MemoryModuleType.ANGRY_AT)) {
++			var uuid = brain.getMemory(MemoryModuleType.ANGRY_AT).orElse(null);
++			if (uuid != null && mob.level().getPlayerByUUID(uuid) != null) {
++				brain.eraseMemory(MemoryModuleType.ANGRY_AT);
++			}
++		}
++	}
++
++	private static void befriend(Entity entity) {
++		if (!(entity instanceof Mob mob) || entity instanceof SkyrimActorEntity || !SkyLink.active()) {
++			return;
++		}
++		if (hostile(mob)) {
++			// No getting even with players either (Minecraft's "hit me and I'll come for you").
++			((MobGoalsAccessor) mob).skycraft$targets().removeAllGoals(goal -> goal instanceof HurtByTargetGoal);
++		}
++		// Goals aren't saved with the mob: a reloaded one starts with Minecraft's again (and loses ours).
++		boolean already = ((MobGoalsAccessor) mob).skycraft$targets().getAvailableGoals().stream()
++			.anyMatch(w -> w.getGoal() instanceof NearestAttackableTargetGoal<?> n
++				&& ((NearestAttackableTargetGoalAccessor) n).skycraft$targetType() == SkyrimActorEntity.class);
++		if (already) {
++			return;
++		}
++		boolean[] hostileToPlayers = { false };
++		boolean hostile = hostile(mob);
++		((MobGoalsAccessor) mob).skycraft$targets().removeAllGoals(goal -> {
++			// (A neutral mob's "after players" goals are its anger at those who hit it: kept.)
++			if (goal instanceof NearestAttackableTargetGoal<?> nearest
++				&& ((NearestAttackableTargetGoalAccessor) nearest).skycraft$targetType().isAssignableFrom(Player.class) && !hostile) {
++				hostileToPlayers[0] = true;
++				return false;
++			}
++			if (goal instanceof NearestAttackableTargetGoal<?> nearest
++				&& ((NearestAttackableTargetGoalAccessor) nearest).skycraft$targetType().isAssignableFrom(Player.class)) {
++				hostileToPlayers[0] = true;
++				return true;
++			}
++			return false;
++		});
++		boolean fights = hostileToPlayers[0] || ((MobGoalsAccessor) mob).skycraft$goals().getAvailableGoals().stream()
++			.anyMatch(w -> w.getGoal().getClass().getSimpleName().contains("Attack") || w.getGoal().getClass().getSimpleName().contains("Swell"));
++		if (!fights) {
++			return;
++		}
++		((MobGoalsAccessor) mob).skycraft$targets().addGoal(1, new NearestAttackableTargetGoal<>(mob, SkyrimActorEntity.class, 5, false, false,
++			(target, level) -> target instanceof SkyrimActorEntity actor && actor.hostile()));
++		if (!logged) {
++			logged = true;
++			SkyCraft.LOG.info("MarioCraft: {} now fights SM64's enemies for the player", mob.getType().toShortString());
++		}
++	}
++}
+diff --git a/fabric/src/main/java/dev/skycraft/world/MarioFalls.java b/fabric/src/main/java/dev/skycraft/world/MarioFalls.java
+new file mode 100644
+index 0000000..3179ff8
+--- /dev/null
++++ b/fabric/src/main/java/dev/skycraft/world/MarioFalls.java
+@@ -0,0 +1,115 @@
++package dev.skycraft.world;
++
++import java.util.HashMap;
++import java.util.Iterator;
++import java.util.Map;
++import java.util.UUID;
++import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerPlayer;
++
++/**
++ * MarioCraft: Minecraft's fall damage, except for the drop SM64 puts the player into: coming into
++ * a level, out of a painting, pipe or warp, or being let go of by a cannon, a pole or Hoot. Mario
++ * lands from all of those unhurt, and the player had no say in how high up they started.
++ *
++ * <p>A player is marked safe when that happens (by their client: SkyClient), and the mark goes with
++ * their next landing (PlayerFallMixin), or once they've stood on the ground for a second, so it
++ * can't save them from a real fall later.
++ */
++public final class MarioFalls {
++	private static final int GROUNDED_TICKS = 20;
++	private static final int MAX_TICKS = 20 * 30; // never longer than half a minute
++	private static final Map<UUID, int[]> SAFE = new HashMap<>(); // uuid -> { ticks on the ground, ticks marked }
++
++	private MarioFalls() {
++	}
++
++	public static void init() {
++		ServerTickEvents.END_SERVER_TICK.register(MarioFalls::tick);
++	}
++
++	/**
++	 * Mario's caps as Minecraft effects, for the next two seconds (refreshed while the cap lasts):
++	 * the wing cap glides (Slow Falling, with its flight), the metal cap is iron (Resistance V,
++	 * Fire Resistance, Water Breathing: Metal Mario is unhurt and walks underwater), the vanish cap
++	 * is Invisibility. (Here because it's the other player-state helper the server keeps.)
++	 */
++	public static void capEffects(ServerPlayer player, int mask) {
++		int ticks = 40;
++		if ((mask & dev.skycraft.link.Proto.SKY_WING_CAP) != 0) {
++			player.addEffect(new net.minecraft.world.effect.MobEffectInstance(net.minecraft.world.effect.MobEffects.SLOW_FALLING, ticks, 0, true, true));
++		}
++		if ((mask & dev.skycraft.link.Proto.SKY_METAL_CAP) != 0) {
++			player.addEffect(new net.minecraft.world.effect.MobEffectInstance(net.minecraft.world.effect.MobEffects.RESISTANCE, ticks, 4, true, true));
++			player.addEffect(new net.minecraft.world.effect.MobEffectInstance(net.minecraft.world.effect.MobEffects.FIRE_RESISTANCE, ticks, 0, true, true));
++			player.addEffect(new net.minecraft.world.effect.MobEffectInstance(net.minecraft.world.effect.MobEffects.WATER_BREATHING, ticks, 0, true, true));
++		}
++		if ((mask & dev.skycraft.link.Proto.SKY_WATER_LEVEL) != 0) {
++			// (short: it's gone a moment after he leaves the water or the level)
++			player.addEffect(new net.minecraft.world.effect.MobEffectInstance(net.minecraft.world.effect.MobEffects.WATER_BREATHING, 25, 0, true, true));
++			player.setAirSupply(player.getMaxAirSupply());
++		}
++		if ((mask & dev.skycraft.link.Proto.SKY_VANISH_CAP) != 0) {
++			player.addEffect(new net.minecraft.world.effect.MobEffectInstance(net.minecraft.world.effect.MobEffects.INVISIBILITY, ticks, 0, true, true));
++		}
++	}
++
++	/**
++	 * SM64 healed the player (coins, a heart, a 1-up): their hearts, and their hunger too. Mario's
++	 * world has no food, and a hungry Steve can't sprint (no long or triple jumps) or heal by himself:
++	 * a coin is a bite to eat.
++	 */
++	public static void marioHeal(ServerPlayer player, float amount) {
++		player.heal(amount);
++		int food = Math.max(1, Math.round(amount));
++		player.getFoodData().eat(food, 0.4F);
++	}
++
++	public static void markSafe(ServerPlayer player) {
++		SAFE.put(player.getUUID(), new int[] { 0, 0 });
++		player.resetFallDistance();
++	}
++
++	/** At a landing: true (and the mark is used up) if this one mustn't hurt. */
++	public static boolean takeSafe(ServerPlayer player) {
++		return SAFE.remove(player.getUUID()) != null;
++	}
++
++	/**
++	 * One of Mario's jumps (a double or triple jump, a backflip, a wall kick: SM64's mariocraft.c)
++	 * took the player this many blocks higher than Minecraft's jump: those blocks of the fall don't
++	 * count. Mario lands his own jumps unhurt; a jump off a cliff still hurts as much as the cliff.
++	 */
++	private static final Map<UUID, float[]> JUMP_BONUS = new HashMap<>(); // uuid -> { blocks, ticks }
++
++	public static void markJump(ServerPlayer player, float blocks) {
++		JUMP_BONUS.put(player.getUUID(), new float[] { Math.max(0.0F, Math.min(blocks, 6.0F)), 0.0F });
++	}
++
++	/** At a landing: the fall, less the last Mario jump's extra height (used up). */
++	public static double takeJumpBonus(ServerPlayer player, double fallDistance) {
++		float[] b = JUMP_BONUS.remove(player.getUUID());
++		return b == null ? fallDistance : Math.max(0.0, fallDistance - b[0]);
++	}
++
++	private static void tick(MinecraftServer server) {
++		JUMP_BONUS.values().removeIf(b -> ++b[1] > 20 * 10);  // (a landing that never came)
++		if (SAFE.isEmpty()) {
++			return;
++		}
++		for (Iterator<Map.Entry<UUID, int[]>> it = SAFE.entrySet().iterator(); it.hasNext(); ) {
++			Map.Entry<UUID, int[]> e = it.next();
++			ServerPlayer player = server.getPlayerList().getPlayer(e.getKey());
++			int[] t = e.getValue();
++			if (player == null || ++t[1] > MAX_TICKS) {
++				it.remove();
++				continue;
++			}
++			t[0] = player.onGround() ? t[0] + 1 : 0;
++			if (t[0] >= GROUNDED_TICKS) {
++				it.remove(); // landed softly (no fall damage call): nothing left to save them from
++			}
++		}
++	}
++}
+diff --git a/fabric/src/main/java/dev/skycraft/world/MarioLives.java b/fabric/src/main/java/dev/skycraft/world/MarioLives.java
+new file mode 100644
+index 0000000..4450cc8
+--- /dev/null
++++ b/fabric/src/main/java/dev/skycraft/world/MarioLives.java
+@@ -0,0 +1,90 @@
++package dev.skycraft.world;
++
++import dev.skycraft.SkyCraft;
++import dev.skycraft.combat.SkyCombat;
++import dev.skycraft.link.Proto;
++import dev.skycraft.link.SkyLink;
++import dev.skycraft.net.SkyNet;
++import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
++import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
++import net.minecraft.network.chat.Component;
++import net.minecraft.server.level.ServerPlayer;
++import net.minecraft.world.effect.MobEffectInstance;
++import net.minecraft.world.effect.MobEffects;
++
++/**
++ * MarioCraft: Steve dies the way Mario does. Running out of hearts costs one of Mario's lives
++ * (SM64 takes him out of the course, as it would Mario) and his hearts come back full, with his
++ * inventory kept. No Minecraft death screen and no respawn: the respawn froze Minecraft's server
++ * for a minute (every command typed meanwhile only ran afterwards), and where Steve goes next is
++ * SM64's to say anyway.
++ */
++public final class MarioLives {
++	private MarioLives() {
++	}
++
++	public static void init() {
++		ServerLivingEntityEvents.ALLOW_DEATH.register((entity, source, amount) -> {
++			if (!(entity instanceof ServerPlayer player) || !SkyLink.active() || player.isSpectator()) {
++				return true;
++			}
++			if (source.is(net.minecraft.world.damagesource.DamageTypes.GENERIC_KILL)) {
++				return true;  // /kill still kills (falling out of the world is a lost life: SM64 puts him back)
++			}
++			long now = player.level().getGameTime();
++			Long last = LAST_LOSS.get(player.getUUID());
++			if (last != null && now - last < 100) {
++				// Still finishing him off (the void hits every tick): one life for it, he's only healed.
++				player.setHealth(player.getMaxHealth());
++				return false;
++			}
++			LAST_LOSS.put(player.getUUID(), now);
++			loseLife(player, SkyCombat.attackerFormId(source));
++			// Said like Minecraft's death messages, in everyone's chat: what SM64 says got him, or
++			// Minecraft's own message (a zombie, a cactus, a fall) when it wasn't SM64.
++			String cause = CAUSES.getOrDefault(player.getUUID(), "");
++			if (cause.isEmpty() && source.is(net.minecraft.world.damagesource.DamageTypes.FELL_OUT_OF_WORLD)) {
++				cause = "fell out of the Mushroom Kingdom";
++			}
++			Component message = cause.isEmpty() ? source.getLocalizedDeathMessage(player)
++				: Component.literal(player.getPlainTextName() + " " + cause);
++			var server = player.level().getServer();
++			if (server != null) {
++				server.getPlayerList().broadcastSystemMessage(message, false);
++			}
++			SkyCraft.LOG.info("MarioCraft: {} lost a life ({})", player.getPlainTextName(), message.getString());
++			return false;
++		});
++	}
++
++	private static final java.util.Map<java.util.UUID, Long> LAST_LOSS = new java.util.HashMap<>();
++
++	/** How SM64's hit being applied right now would kill this player (SkyCombat.hurtPlayer), or "". Server thread. */
++	private static final java.util.Map<java.util.UUID, String> CAUSES = new java.util.HashMap<>();
++
++	public static void cause(ServerPlayer player, String cause) {
++		if (cause == null || cause.isEmpty()) {
++			CAUSES.remove(player.getUUID());
++		} else {
++			CAUSES.put(player.getUUID(), cause);
++		}
++	}
++
++	private static void loseLife(ServerPlayer player, int attacker) {
++		// Tell their SM64: the host's through the link, a guest's through their Minecraft.
++		if (SkyNet.isHost(player)) {
++			SkyLink.pushEvent(Proto.EV_PLAYER_DIED, attacker, 0, 0, 0, 0, 0);
++		} else if (ServerPlayNetworking.canSend(player, SkyNet.Died.TYPE)) {
++			ServerPlayNetworking.send(player, new SkyNet.Died(attacker));
++		}
++		player.setHealth(player.getMaxHealth());
++		player.getFoodData().setFoodLevel(20);
++		player.clearFire();
++		player.setAirSupply(player.getMaxAirSupply());
++		player.resetFallDistance();
++		// A few seconds of safety while SM64 takes him out (whatever finished him may still be there).
++		player.addEffect(new MobEffectInstance(MobEffects.RESISTANCE, 100, 4, true, false));
++		player.addEffect(new MobEffectInstance(MobEffects.FIRE_RESISTANCE, 100, 0, true, false));
++		MarioFalls.markSafe(player);
++	}
++}
+diff --git a/fabric/src/main/java/dev/skycraft/world/MarioMobs.java b/fabric/src/main/java/dev/skycraft/world/MarioMobs.java
+new file mode 100644
+index 0000000..74f3975
+--- /dev/null
++++ b/fabric/src/main/java/dev/skycraft/world/MarioMobs.java
+@@ -0,0 +1,122 @@
++package dev.skycraft.world;
++
++import dev.skycraft.SkyCraft;
++import dev.skycraft.link.SkyLink;
++import java.util.List;
++import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
++import net.minecraft.core.BlockPos;
++import net.minecraft.core.registries.BuiltInRegistries;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.level.ServerLevel;
++import net.minecraft.server.level.ServerPlayer;
++import net.minecraft.util.RandomSource;
++import net.minecraft.world.entity.EntitySpawnReason;
++import net.minecraft.world.entity.EntityType;
++import net.minecraft.world.entity.Mob;
++import net.minecraft.world.entity.animal.Animal;
++import net.minecraft.world.entity.monster.Monster;
++import net.minecraft.world.phys.AABB;
++
++/**
++ * MarioCraft: Minecraft's mobs in Mario's levels.
++ *
++ * Minecraft's own spawning only puts mobs on Minecraft blocks, and Mario's levels aren't made of
++ * blocks (their shape comes from SM64, see SkyCollision). So this spawns them itself: every couple
++ * of seconds, if there are fewer than a handful around Mario, one more appears on SM64's ground
++ * somewhere 14-30 blocks away. Monsters and animals both, like a Minecraft night.
++ */
++public final class MarioMobs {
++	private static final int MAX_MONSTERS = 6;
++	private static final int MAX_ANIMALS = 4;
++	private static final double COUNT_RANGE = 48.0;
++	private static final int EVERY_TICKS = 40;
++
++	// By name, looked up in Minecraft's registry (stays valid however Minecraft organises its classes).
++	private static final String[] MONSTERS = { "zombie", "zombie", "skeleton", "creeper", "spider" };
++	private static final String[] ANIMALS = { "cow", "pig", "sheep", "chicken" };
++
++	private static final java.util.Map<String, EntityType<?>> TYPES = new java.util.HashMap<>();
++
++	/** A mob type by its Minecraft name ("zombie"), from Minecraft's registry of entity types. */
++	private static EntityType<?> typeNamed(String name) {
++		if (TYPES.isEmpty()) {
++			for (EntityType<?> type : BuiltInRegistries.ENTITY_TYPE) {
++				var id = BuiltInRegistries.ENTITY_TYPE.getKey(type);
++				if (id != null && "minecraft".equals(id.getNamespace())) {
++					TYPES.put(id.getPath(), type);
++				}
++			}
++		}
++		return TYPES.get(name);
++	}
++
++	private static int ticks;
++	private static boolean logged;
++
++	private MarioMobs() {
++	}
++
++	public static void init() {
++		ServerTickEvents.END_SERVER_TICK.register(MarioMobs::serverTick);
++	}
++
++	private static void serverTick(MinecraftServer server) {
++		if (++ticks % EVERY_TICKS != 0 || !SkyLink.active() || !SkyCollision.active()) {
++			return;
++		}
++		List<ServerPlayer> players = server.getPlayerList().getPlayers();
++		if (players.isEmpty()) {
++			return;
++		}
++		ServerPlayer player = players.getFirst();
++		ServerLevel level = player.level();
++		AABB around = player.getBoundingBox().inflate(COUNT_RANGE);
++		int monsters = level.getEntitiesOfClass(Monster.class, around).size();
++		int animals = level.getEntitiesOfClass(Animal.class, around).size();
++		RandomSource random = level.getRandom();
++		if (monsters < MAX_MONSTERS) {
++			trySpawn(level, player, MONSTERS[random.nextInt(MONSTERS.length)], random);
++		}
++		if (animals < MAX_ANIMALS && random.nextInt(3) == 0) {
++			trySpawn(level, player, ANIMALS[random.nextInt(ANIMALS.length)], random);
++		}
++	}
++
++	private static void trySpawn(ServerLevel level, ServerPlayer player, String name, RandomSource random) {
++		EntityType<?> type = typeNamed(name);
++		if (type == null) {
++			return;
++		}
++		double angle = random.nextDouble() * Math.PI * 2.0;
++		double distance = 14.0 + random.nextDouble() * 16.0;
++		int x = (int) Math.floor(player.getX() + Math.cos(angle) * distance);
++		int z = (int) Math.floor(player.getZ() + Math.sin(angle) * distance);
++		int top = (int) Math.floor(player.getY()) + 12;
++		// Highest SM64 ground (or Minecraft block) in this column, near Mario's height, with room
++		// above it for the mob.
++		for (int y = top; y > top - 32; y--) {
++			BlockPos ground = new BlockPos(x, y, z);
++			boolean solid = SkyCollision.hasGeometry(ground) || !level.getBlockState(ground).isAir();
++			if (!solid) {
++				continue;
++			}
++			BlockPos feet = ground.above();
++			if (SkyCollision.hasGeometry(feet) || SkyCollision.hasGeometry(feet.above())
++				|| !level.getBlockState(feet).isAir() || !level.getBlockState(feet.above()).isAir()) {
++				return; // inside a wall or under a ceiling: try another spot next time
++			}
++			if (!(type.create(level, EntitySpawnReason.NATURAL) instanceof Mob mob)) {
++				return;
++			}
++			// Just above the ground; it drops onto SM64's surface.
++			double groundTop = y + Math.max(SkyCollision.groundTop(ground), 0.0F);
++			mob.snapTo(x + 0.5, groundTop + 0.05, z + 0.5, random.nextFloat() * 360.0F, 0.0F);
++			mob.finalizeSpawn(level, level.getCurrentDifficultyAt(feet), EntitySpawnReason.NATURAL, null);
++			if (level.addFreshEntity(mob) && !logged) {
++				logged = true;
++				SkyCraft.LOG.info("MarioCraft: mobs are spawning in Mario's level (first: {})", name);
++			}
++			return;
++		}
++	}
++}
+diff --git a/fabric/src/main/java/dev/skycraft/world/SkyCollision.java b/fabric/src/main/java/dev/skycraft/world/SkyCollision.java
+index 0d32dc8..ca88529 100644
+--- a/fabric/src/main/java/dev/skycraft/world/SkyCollision.java
++++ b/fabric/src/main/java/dev/skycraft/world/SkyCollision.java
+@@ -243,9 +243,20 @@ public final class SkyCollision {
+ 			}
+ 			long payload = data + pos + 8;
+ 			switch (type) {
+-				case COL_CLEAR -> clear(s.get(JAVA_INT, payload));
+-				case COL_REGION -> readRegion(s, payload);
+-				case COL_TRIS -> readTris(s, payload);
++				case COL_CLEAR -> {
++					clear(s.get(JAVA_INT, payload));
++					UPLOAD_REGIONS.clear();
++					UPLOAD_TRIS.clear();
++					UPLOAD_QUEUE.clear();
++				}
++				case COL_REGION -> {
++					readRegion(s, payload, false);
++					keepForUpload(UPLOAD_REGIONS, COL_REGION, s, payload, payloadBytes);
++				}
++				case COL_TRIS -> {
++					readTris(s, payload, false);
++					keepForUpload(UPLOAD_TRIS, COL_TRIS, s, payload, payloadBytes);
++				}
+ 				default -> SkyCraft.LOG.warn("SkyCraft: unknown collision message {}", type);
+ 			}
+ 			tail += align8(8 + payloadBytes);
+@@ -275,9 +286,85 @@ public final class SkyCollision {
+ 		KNOWN_REGIONS.clear();
+ 		epoch = newEpoch;
+ 		SkyCraft.LOG.info("SkyCraft: collision cleared (epoch {})", newEpoch);
++		// The host changed level: its own shape goes, but guests' levels are still there.
++		for (byte[] msg : GUEST_MSGS.values()) {
++			ingestGuest(msg, false);
++		}
++	}
++
++	// ---- MarioCraft multiplayer: a guest's level shape, for the host's server -------------------
++	// The server's collision comes from the host's SM64 (shared memory). A guest in another level
++	// sent its shape only to its own Minecraft: on the server, items and mobs near them fell through.
++	// A guest's client keeps every region it got (the latest of each) and uploads them (GuestShape-
++	// Client, SkyNet.GuestShape); the server adds them (ingestGuest). SM64 levels each have their own
++	// patch of the Minecraft world, so a guest's regions never overwrite another level's.
++	private static final ConcurrentHashMap<Long, byte[]> UPLOAD_REGIONS = new ConcurrentHashMap<>();
++	private static final ConcurrentHashMap<Long, byte[]> UPLOAD_TRIS = new ConcurrentHashMap<>();
++	private static final java.util.concurrent.ConcurrentLinkedQueue<byte[]> UPLOAD_QUEUE = new java.util.concurrent.ConcurrentLinkedQueue<>();
++
++	private static void keepForUpload(ConcurrentHashMap<Long, byte[]> store, int type, MemorySegment s, long payload, int payloadBytes) {
++		// (type, padding, then the payload at 8: its 8-byte values stay 8-byte aligned)
++		byte[] msg = new byte[8 + payloadBytes];
++		java.nio.ByteBuffer.wrap(msg).order(java.nio.ByteOrder.nativeOrder()).putInt(type);
++		MemorySegment.copy(s, JAVA_BYTE, payload, msg, 8, payloadBytes);
++		long key = BlockPos.asLong(s.get(JAVA_INT, payload), s.get(JAVA_INT, payload + 4), s.get(JAVA_INT, payload + 8));
++		store.put(key, msg);
++		if (uploading) {
++			UPLOAD_QUEUE.add(msg);
++		}
++	}
++
++	/** Set by a guest's client while it's in a friend's world: new regions are queued for upload. */
++	public static volatile boolean uploading;
++
++	/** The next collision message (type, then payload) waiting to go to the host's server, or null. */
++	public static byte @Nullable [] pollUpload() {
++		return UPLOAD_QUEUE.poll();
++	}
++
++	/** Just joined a server: everything this client has of the level goes up again. */
++	public static void requeueAllForUpload() {
++		UPLOAD_QUEUE.clear();
++		UPLOAD_QUEUE.addAll(UPLOAD_REGIONS.values());
++		UPLOAD_QUEUE.addAll(UPLOAD_TRIS.values());
++	}
++
++	/** Server: a guest's region or triangles (type, then payload, as in the collision ring). */
++	public static void ingestGuest(byte[] msg) {
++		ingestGuest(msg, true);
+ 	}
+ 
+-	private static void readRegion(MemorySegment s, long p) {
++	/** Every guest region the server got, the latest of each, to put back after the host's level changes. */
++	private static final ConcurrentHashMap<Long, byte[]> GUEST_MSGS = new ConcurrentHashMap<>();
++
++	private static void ingestGuest(byte[] msg, boolean keep) {
++		if (msg.length < 8 + COL_REGION_HEADER_BYTES) {
++			return;
++		}
++		if (keep) {
++			java.nio.ByteBuffer b = java.nio.ByteBuffer.wrap(msg).order(java.nio.ByteOrder.nativeOrder());
++			long key = BlockPos.asLong(b.getInt(8), b.getInt(12), b.getInt(16)) * 31 + b.getInt(0);
++			if (GUEST_MSGS.size() < 6000 || GUEST_MSGS.containsKey(key)) {  // (a few levels' worth: memory)
++				GUEST_MSGS.put(key, msg);
++			}
++		}
++		// Off the heap and aligned, as the ring is (the readers use aligned int and long access).
++		MemorySegment s = java.lang.foreign.Arena.ofAuto().allocate(msg.length, 8);
++		MemorySegment.copy(msg, 0, s, JAVA_BYTE, 0, msg.length);
++		int type = s.get(JAVA_INT, 0);
++		long count = Integer.toUnsignedLong(s.get(JAVA_INT, 8 + 28));
++		long need = 8 + COL_REGION_HEADER_BYTES + count * (type == COL_REGION ? COL_BLOCK_BYTES : COL_TRI_BYTES);
++		if (need > msg.length) {
++			return;  // (cut short: a guest's client sent less than it said)
++		}
++		if (type == COL_REGION) {
++			readRegion(s, 8, true);
++		} else if (type == COL_TRIS) {
++			readTris(s, 8, true);
++		}
++	}
++
++	private static void readRegion(MemorySegment s, long p, boolean guest) {
+ 		int minX = s.get(JAVA_INT, p);
+ 		int minY = s.get(JAVA_INT, p + 4);
+ 		int minZ = s.get(JAVA_INT, p + 8);
+@@ -286,9 +373,11 @@ public final class SkyCollision {
+ 		int maxZ = s.get(JAVA_INT, p + 20);
+ 		int msgEpoch = s.get(JAVA_INT, p + 24);
+ 		int count = s.get(JAVA_INT, p + 28);
+-		adoptEpochIfFresh(msgEpoch);
+-		if (msgEpoch != epoch) {
+-			return; // stale region from before a world change
++		if (!guest) {
++			adoptEpochIfFresh(msgEpoch);
++			if (msgEpoch != epoch) {
++				return; // stale region from before a world change
++			}
+ 		}
+ 
+ 		// Build the new shapes first so readers never see a half-empty region.
+@@ -332,15 +421,17 @@ public final class SkyCollision {
+ 		}
+ 	}
+ 
+-	private static void readTris(MemorySegment s, long p) {
++	private static void readTris(MemorySegment s, long p, boolean guest) {
+ 		int minX = s.get(JAVA_INT, p);
+ 		int minY = s.get(JAVA_INT, p + 4);
+ 		int minZ = s.get(JAVA_INT, p + 8);
+ 		int msgEpoch = s.get(JAVA_INT, p + 24);
+ 		int count = s.get(JAVA_INT, p + 28);
+-		adoptEpochIfFresh(msgEpoch);
+-		if (msgEpoch != epoch) {
+-			return;
++		if (!guest) {
++			adoptEpochIfFresh(msgEpoch);
++			if (msgEpoch != epoch) {
++				return;
++			}
+ 		}
+ 		SkyTri[] tris = new SkyTri[count];
+ 		java.util.List<SkyTri> ghosts = new java.util.ArrayList<>();
+diff --git a/fabric/src/main/java/dev/skycraft/world/SkyDig.java b/fabric/src/main/java/dev/skycraft/world/SkyDig.java
+index 8075d5b..28d5943 100644
+--- a/fabric/src/main/java/dev/skycraft/world/SkyDig.java
++++ b/fabric/src/main/java/dev/skycraft/world/SkyDig.java
+@@ -261,6 +261,56 @@ public final class SkyDig {
+ 			case DIG_WEB -> Blocks.COBWEB.defaultBlockState();
+ 			case DIG_ASH -> Blocks.CONCRETE_POWDER.pick(DyeColor.LIGHT_GRAY).defaultBlockState();
+ 			case DIG_BEDROCK -> Blocks.BEDROCK.defaultBlockState();
++			case DIG_BRICKS -> Blocks.BRICKS.defaultBlockState();
++			case DIG_RED_WOOL -> Blocks.WOOL.pick(DyeColor.RED).defaultBlockState();
++			case DIG_STONE_BRICKS -> Blocks.STONE_BRICKS.defaultBlockState();
++			case DIG_MOSSY_STONE_BRICKS -> Blocks.MOSSY_STONE_BRICKS.defaultBlockState();
++			case DIG_SMOOTH_STONE -> Blocks.SMOOTH_STONE.defaultBlockState();
++			case DIG_QUARTZ -> Blocks.QUARTZ_BLOCK.defaultBlockState();
++			case DIG_QUARTZ_BRICKS -> Blocks.QUARTZ_BRICKS.defaultBlockState();
++			case DIG_QUARTZ_PILLAR -> Blocks.QUARTZ_PILLAR.defaultBlockState();
++			case DIG_SANDSTONE -> Blocks.SANDSTONE.defaultBlockState();
++			case DIG_SMOOTH_SANDSTONE -> Blocks.SMOOTH_SANDSTONE.defaultBlockState();
++			case DIG_CUT_SANDSTONE -> Blocks.CUT_SANDSTONE.defaultBlockState();
++			case DIG_OAK_PLANKS -> Blocks.OAK_PLANKS.defaultBlockState();
++			case DIG_DARK_OAK_PLANKS -> Blocks.DARK_OAK_PLANKS.defaultBlockState();
++			case DIG_BIRCH_PLANKS -> Blocks.BIRCH_PLANKS.defaultBlockState();
++			case DIG_OAK_FENCE -> Blocks.OAK_FENCE.defaultBlockState();
++			case DIG_IRON_BARS -> Blocks.IRON_BARS.defaultBlockState();
++			case DIG_TILES -> Blocks.POLISHED_DIORITE.defaultBlockState();
++			case DIG_GREEN_WOOL -> Blocks.WOOL.pick(DyeColor.GREEN).defaultBlockState();
++			case DIG_GOLD -> Blocks.GOLD_BLOCK.defaultBlockState();
++			case DIG_IRON -> Blocks.IRON_BLOCK.defaultBlockState();
++			case DIG_COPPER -> Blocks.CUT_COPPER.waxed().unaffected().defaultBlockState();
++			case DIG_TERRACOTTA -> Blocks.TERRACOTTA.defaultBlockState();
++			case DIG_RED_TERRACOTTA -> Blocks.DYED_TERRACOTTA.pick(DyeColor.RED).defaultBlockState();
++			case DIG_GRANITE -> Blocks.GRANITE.defaultBlockState();
++			case DIG_ANDESITE -> Blocks.ANDESITE.defaultBlockState();
++			case DIG_DIORITE -> Blocks.DIORITE.defaultBlockState();
++			case DIG_POLISHED_ANDESITE -> Blocks.POLISHED_ANDESITE.defaultBlockState();
++			case DIG_MOSSY_COBBLE -> Blocks.MOSSY_COBBLESTONE.defaultBlockState();
++			case DIG_COARSE_DIRT -> Blocks.COARSE_DIRT.defaultBlockState();
++			case DIG_MUSHROOM -> Blocks.RED_MUSHROOM_BLOCK.defaultBlockState();
++			case DIG_BLUE_ICE -> Blocks.BLUE_ICE.defaultBlockState();
++			case DIG_PRISMARINE -> Blocks.PRISMARINE.defaultBlockState();
++			case DIG_DARK_PRISMARINE -> Blocks.DARK_PRISMARINE.defaultBlockState();
++			case DIG_BOOKSHELF -> Blocks.BOOKSHELF.defaultBlockState();
++			case DIG_GLOWSTONE -> Blocks.GLOWSTONE.defaultBlockState();
++			case DIG_NETHERRACK -> Blocks.NETHERRACK.defaultBlockState();
++			case DIG_BLACKSTONE -> Blocks.BLACKSTONE.defaultBlockState();
++			case DIG_MAGMA -> Blocks.MAGMA_BLOCK.defaultBlockState();
++			case DIG_DEEPSLATE -> Blocks.COBBLED_DEEPSLATE.defaultBlockState();
++			case DIG_DEEPSLATE_TILES -> Blocks.DEEPSLATE_TILES.defaultBlockState();
++			case DIG_DRIPSTONE -> Blocks.DRIPSTONE_BLOCK.defaultBlockState();
++			case DIG_CHISELED_STONE_BRICKS -> Blocks.CHISELED_STONE_BRICKS.defaultBlockState();
++			case DIG_LAPIS -> Blocks.LAPIS_BLOCK.defaultBlockState();
++			case DIG_YELLOW_WOOL -> Blocks.WOOL.pick(DyeColor.YELLOW).defaultBlockState();
++			case DIG_GREEN_TERRACOTTA -> Blocks.DYED_TERRACOTTA.pick(DyeColor.GREEN).defaultBlockState();
++			case DIG_WHITE_TERRACOTTA -> Blocks.DYED_TERRACOTTA.pick(DyeColor.WHITE).defaultBlockState();
++			case DIG_WHITE_WOOL -> Blocks.WOOL.pick(DyeColor.WHITE).defaultBlockState();
++			case DIG_RED_SANDSTONE -> Blocks.RED_SANDSTONE.defaultBlockState();
++			case DIG_POLISHED_BLACKSTONE -> Blocks.POLISHED_BLACKSTONE.defaultBlockState();
++			case DIG_PACKED_ICE -> Blocks.PACKED_ICE.defaultBlockState();
+ 			default -> Blocks.STONE.defaultBlockState();
+ 		};
+ 	}
+@@ -471,7 +521,11 @@ public final class SkyDig {
+ 				}
+ 				return above.material == DIG_NONE ? DIG_STONE : above.material;
+ 			}
+-			return above != null || landBelow ? AIR : DIG_STONE;
++			// MarioCraft: SM64's levels mark no "land" (that's Skyrim's terrain), so "no land anywhere"
++			// was every bit of open sky: TNT and Wither blasts lined their craters' tops with floating
++			// stone. Open sky (or an underside above) is air; under the top of something is inside it
++			// (above).
++			return AIR;
+ 		}
+ 
+ 		private List<SkyTri> nearCell(double px, double py, double pz) {
+@@ -603,6 +657,24 @@ public final class SkyDig {
+ 			case DIG_PLANKS -> depth < 2.5 ? DIG_PLANKS : DIG_STONE;
+ 			case DIG_METAL -> depth < 1.5 ? DIG_METAL : DIG_STONE;
+ 			case DIG_GLASS, DIG_ORGANIC, DIG_CLOTH, DIG_BONE, DIG_WEB -> depth < 1.0 ? surface : DIG_STONE;
++			case DIG_BRICKS -> depth < 1.5 ? DIG_BRICKS : DIG_STONE;
++			case DIG_RED_WOOL -> depth < 1.0 ? DIG_RED_WOOL : DIG_PLANKS;
++			// MarioCraft: built things are a block or two thick (walls, floors), with stone behind;
++			// natural ground goes on further; carpets, fences and rails sit on planks.
++			case DIG_GREEN_WOOL, DIG_YELLOW_WOOL, DIG_WHITE_WOOL -> depth < 1.0 ? surface : DIG_OAK_PLANKS;
++			case DIG_OAK_FENCE -> depth < 1.0 ? DIG_OAK_FENCE : DIG_OAK_PLANKS;
++			case DIG_IRON_BARS -> depth < 1.0 ? DIG_IRON_BARS : DIG_STONE;
++			case DIG_OAK_PLANKS, DIG_DARK_OAK_PLANKS, DIG_BIRCH_PLANKS, DIG_BOOKSHELF -> depth < 2.5 ? surface : DIG_STONE;
++			case DIG_COARSE_DIRT -> depth < 3.5 ? DIG_COARSE_DIRT : DIG_STONE;
++			case DIG_SANDSTONE, DIG_SMOOTH_SANDSTONE, DIG_CUT_SANDSTONE, DIG_RED_SANDSTONE -> depth < 2.5 ? surface : DIG_STONE;
++			case DIG_MUSHROOM -> depth < 1.0 ? DIG_MUSHROOM : DIG_OAK_LOG;
++			case DIG_PACKED_ICE, DIG_BLUE_ICE -> depth < 2.5 ? surface : DIG_STONE;
++			case DIG_NETHERRACK, DIG_BLACKSTONE, DIG_MAGMA -> depth < 3.5 ? (surface == DIG_MAGMA ? DIG_NETHERRACK : surface) : DIG_STONE;
++			case DIG_GRANITE, DIG_ANDESITE, DIG_DIORITE, DIG_DRIPSTONE, DIG_DEEPSLATE, DIG_MOSSY_COBBLE -> depth < 3.5 ? surface : DIG_STONE;
++			case DIG_STONE_BRICKS, DIG_MOSSY_STONE_BRICKS, DIG_SMOOTH_STONE, DIG_QUARTZ, DIG_QUARTZ_BRICKS, DIG_QUARTZ_PILLAR,
++				DIG_TILES, DIG_GOLD, DIG_IRON, DIG_COPPER, DIG_TERRACOTTA, DIG_RED_TERRACOTTA, DIG_POLISHED_ANDESITE,
++				DIG_PRISMARINE, DIG_DARK_PRISMARINE, DIG_GLOWSTONE, DIG_DEEPSLATE_TILES, DIG_CHISELED_STONE_BRICKS, DIG_LAPIS,
++				DIG_GREEN_TERRACOTTA, DIG_WHITE_TERRACOTTA, DIG_POLISHED_BLACKSTONE -> depth < 1.5 ? surface : DIG_STONE;
+ 			default -> DIG_STONE;
+ 		};
+ 	}
+diff --git a/fabric/src/main/java/dev/skycraft/world/SkyDigBlast.java b/fabric/src/main/java/dev/skycraft/world/SkyDigBlast.java
+index ff32e9b..0234573 100644
+--- a/fabric/src/main/java/dev/skycraft/world/SkyDigBlast.java
++++ b/fabric/src/main/java/dev/skycraft/world/SkyDigBlast.java
+@@ -46,6 +46,8 @@ public final class SkyDigBlast {
+ 	/** For an explosion about to go off: null unless Skyrim's geometry around it is known. */
+ 	public static @Nullable SkyDigBlast begin(ServerExplosion explosion) {
+ 		Vec3 c = explosion.center();
++		// (A Wither's blasts dig like any other again: their craters were lined with floating stone
++		// because open sky counted as buried rock, fixed in SkyDig.Probe.farFromSurfaces.)
+ 		if (!SkyDig.destruction || !SkyCollision.active() || !SkyCollision.isKnown((int) Math.floor(c.x), (int) Math.floor(c.y), (int) Math.floor(c.z)) || !SkyLink.readSkyState(SKY)) {
+ 			return null;
+ 		}
+diff --git a/fabric/src/main/java/dev/skycraft/world/SkyRay.java b/fabric/src/main/java/dev/skycraft/world/SkyRay.java
+index 01572c8..03ff4a6 100644
+--- a/fabric/src/main/java/dev/skycraft/world/SkyRay.java
++++ b/fabric/src/main/java/dev/skycraft/world/SkyRay.java
+@@ -71,9 +71,17 @@ public final class SkyRay {
+ 	 */
+ 	public static int[] placementCell(Hit hit) {
+ 		double out = 0.4;
+-		return new int[] {
++		int[] cell = {
+ 			(int) Math.floor(hit.x + hit.nx * out), (int) Math.floor(hit.y + hit.ny * out), (int) Math.floor(hit.z + hit.nz * out)
+ 		};
++		// MarioCraft: on a floor, the block floats at most 0.25 above the ground there, so its top is
++		// never more than 1.25 up (a player's jump) and it can always be jumped onto. SM64's floors
++		// aren't on the block grid: with 0.4 a block could float 0.4 up, its top 1.4, out of reach.
++		// (Also keeps the hit within the server's check: at most a block from the cell's centre.)
++		if (hit.ny > 0.7) {
++			cell[1] = (int) Math.floor(hit.y + 0.25);
++		}
++		return cell;
+ 	}
+ 
+ 	/** The cell just inside the surface (what a projectile is stuck in). */
+diff --git a/fabric/src/main/java/dev/skycraft/world/SkyTri.java b/fabric/src/main/java/dev/skycraft/world/SkyTri.java
+index 9fd370c..dd4abbe 100644
+--- a/fabric/src/main/java/dev/skycraft/world/SkyTri.java
++++ b/fabric/src/main/java/dev/skycraft/world/SkyTri.java
+@@ -56,7 +56,8 @@ public final class SkyTri {
+ 		this.maxY = Math.max(this.ay, Math.max(this.by, this.cy));
+ 		this.maxZ = Math.max(this.az, Math.max(this.bz, this.cz));
+ 		this.stairHelper = stairHelper;
+-		this.walkable = stairHelper || Math.abs(this.ny) >= WALKABLE_NY;
++		this.walkable = stairHelper || Math.abs(this.ny) >= WALKABLE_NY
++			|| ((flags & dev.skycraft.link.Proto.TRI_WALKABLE) != 0 && Math.abs(this.ny) >= 0.4);
+ 	}
+ 
+ 	public boolean degenerate() {
+diff --git a/fabric/src/main/java/dev/skycraft/world/TriCollider.java b/fabric/src/main/java/dev/skycraft/world/TriCollider.java
+index 14c9bf5..0ed2497 100644
+--- a/fabric/src/main/java/dev/skycraft/world/TriCollider.java
++++ b/fabric/src/main/java/dev/skycraft/world/TriCollider.java
+@@ -45,12 +45,49 @@ public final class TriCollider {
+ 	 * Resolves one tick of movement {@code (mx, my, mz)} for a player whose feet are centred at
+ 	 * {@code (x0, y0, z0)}. Returns the allowed movement.
+ 	 */
++	/** Moves longer than this are done in pieces (an elytra with rockets covers 2-3 blocks a tick). */
++	private static final double MAX_PIECE = 0.45;
++
+ 	public static double[] resolve(
+ 		List<SkyTri> tris, double x0, double y0, double z0, double radius, double height, double step, boolean wasOnGround, double mx, double my, double mz
+ 	) {
+ 		if (tris.isEmpty()) {
+ 			return new double[] { mx, my, mz };
+ 		}
++		// One pass moves sideways at the starting height and only then up or down at the end point:
++		// a fast, steep move (flying with an elytra and rockets, a long fall) went straight through a
++		// floor, a roof or a slope it crossed on the way. Long moves go in short pieces, each a pass.
++		double length = Math.sqrt(mx * mx + my * my + mz * mz);
++		if (length <= MAX_PIECE) {
++			return resolveOnce(tris, x0, y0, z0, radius, height, step, wasOnGround, mx, my, mz);
++		}
++		int pieces = (int) Math.ceil(length / MAX_PIECE);
++		double px = mx / pieces, py = my / pieces, pz = mz / pieces;
++		double x = x0, y = y0, z = z0;
++		boolean ground = wasOnGround, changed = false, stoppedY = false;
++		for (int i = 0; i < pieces; i++) {
++			double wantY = stoppedY ? 0.0 : py;
++			double[] r = resolveOnce(tris, x, y, z, radius, height, step, ground, px, wantY, pz);
++			if (r[0] != px || r[2] != pz || r[1] != wantY) {
++				changed = true;
++			}
++			if (r[1] != wantY) {
++				stoppedY = true;  // landed or hit a ceiling: no more of the up or down move
++				ground = wantY <= 0.0;
++			}
++			x += r[0];
++			y += r[1];
++			z += r[2];
++		}
++		if (!changed && !stoppedY) {
++			return new double[] { mx, my, mz };  // (Minecraft compares with what it asked for exactly)
++		}
++		return new double[] { x - x0, y - y0, z - z0 };
++	}
++
++	private static double[] resolveOnce(
++		List<SkyTri> tris, double x0, double y0, double z0, double radius, double height, double step, boolean wasOnGround, double mx, double my, double mz
++	) {
+ 
+ 		double x = x0, y = y0, z = z0;
+ 
+diff --git a/fabric/src/main/resources/assets/skycraft/lang/en_us.json b/fabric/src/main/resources/assets/skycraft/lang/en_us.json
+index d9e84d0..a61c4bf 100644
+--- a/fabric/src/main/resources/assets/skycraft/lang/en_us.json
++++ b/fabric/src/main/resources/assets/skycraft/lang/en_us.json
+@@ -1,3 +1,3 @@
+ {
+-  "entity.skycraft.skyrim_actor": "Skyrim NPC"
++  "entity.skycraft.skyrim_actor": "Mario Enemy"
+ }
+diff --git a/fabric/src/main/resources/assets/skycraft/sounds.json b/fabric/src/main/resources/assets/skycraft/sounds.json
+new file mode 100644
+index 0000000..fa34c47
+--- /dev/null
++++ b/fabric/src/main/resources/assets/skycraft/sounds.json
+@@ -0,0 +1,258 @@
++{
++    "music.game.minecraft":  {
++                                 "sounds":  [
++                                                {
++                                                    "name":  "minecraft:music/game/minecraft",
++                                                    "stream":  true
++                                                }
++                                            ]
++                             },
++    "music.game.clark":  {
++                             "sounds":  [
++                                            {
++                                                "name":  "minecraft:music/game/clark",
++                                                "stream":  true
++                                            }
++                                        ]
++                         },
++    "music.game.sweden":  {
++                              "sounds":  [
++                                             {
++                                                 "name":  "minecraft:music/game/sweden",
++                                                 "stream":  true
++                                             }
++                                         ]
++                          },
++    "music.game.subwoofer_lullaby":  {
++                                         "sounds":  [
++                                                        {
++                                                            "name":  "minecraft:music/game/subwoofer_lullaby",
++                                                            "stream":  true
++                                                        }
++                                                    ]
++                                     },
++    "music.game.living_mice":  {
++                                   "sounds":  [
++                                                  {
++                                                      "name":  "minecraft:music/game/living_mice",
++                                                      "stream":  true
++                                                  }
++                                              ]
++                               },
++    "music.game.haggstrom":  {
++                                 "sounds":  [
++                                                {
++                                                    "name":  "minecraft:music/game/haggstrom",
++                                                    "stream":  true
++                                                }
++                                            ]
++                             },
++    "music.game.danny":  {
++                             "sounds":  [
++                                            {
++                                                "name":  "minecraft:music/game/danny",
++                                                "stream":  true
++                                            }
++                                        ]
++                         },
++    "music.game.key":  {
++                           "sounds":  [
++                                          {
++                                              "name":  "minecraft:music/game/key",
++                                              "stream":  true
++                                          }
++                                      ]
++                       },
++    "music.game.oxygene":  {
++                               "sounds":  [
++                                              {
++                                                  "name":  "minecraft:music/game/oxygene",
++                                                  "stream":  true
++                                              }
++                                          ]
++                           },
++    "music.game.dry_hands":  {
++                                 "sounds":  [
++                                                {
++                                                    "name":  "minecraft:music/game/dry_hands",
++                                                    "stream":  true
++                                                }
++                                            ]
++                             },
++    "music.game.wet_hands":  {
++                                 "sounds":  [
++                                                {
++                                                    "name":  "minecraft:music/game/wet_hands",
++                                                    "stream":  true
++                                                }
++                                            ]
++                             },
++    "music.game.mice_on_venus":  {
++                                     "sounds":  [
++                                                    {
++                                                        "name":  "minecraft:music/game/mice_on_venus",
++                                                        "stream":  true
++                                                    }
++                                                ]
++                                 },
++    "music.game.creative.biome_fest":  {
++                                           "sounds":  [
++                                                          {
++                                                              "name":  "minecraft:music/game/creative/biome_fest",
++                                                              "stream":  true
++                                                          }
++                                                      ]
++                                       },
++    "music.game.creative.blind_spots":  {
++                                            "sounds":  [
++                                                           {
++                                                               "name":  "minecraft:music/game/creative/blind_spots",
++                                                               "stream":  true
++                                                           }
++                                                       ]
++                                        },
++    "music.game.creative.haunt_muskie":  {
++                                             "sounds":  [
++                                                            {
++                                                                "name":  "minecraft:music/game/creative/haunt_muskie",
++                                                                "stream":  true
++                                                            }
++                                                        ]
++                                         },
++    "music.game.creative.aria_math":  {
++                                          "sounds":  [
++                                                         {
++                                                             "name":  "minecraft:music/game/creative/aria_math",
++                                                             "stream":  true
++                                                         }
++                                                     ]
++                                      },
++    "music.game.creative.dreiton":  {
++                                        "sounds":  [
++                                                       {
++                                                           "name":  "minecraft:music/game/creative/dreiton",
++                                                           "stream":  true
++                                                       }
++                                                   ]
++                                    },
++    "music.game.creative.taswell":  {
++                                        "sounds":  [
++                                                       {
++                                                           "name":  "minecraft:music/game/creative/taswell",
++                                                           "stream":  true
++                                                       }
++                                                   ]
++                                    },
++    "music.game.nether.concrete_halls":  {
++                                             "sounds":  [
++                                                            {
++                                                                "name":  "minecraft:music/game/nether/concrete_halls",
++                                                                "stream":  true
++                                                            }
++                                                        ]
++                                         },
++    "music.game.nether.dead_voxel":  {
++                                         "sounds":  [
++                                                        {
++                                                            "name":  "minecraft:music/game/nether/dead_voxel",
++                                                            "stream":  true
++                                                        }
++                                                    ]
++                                     },
++    "music.game.nether.warmth":  {
++                                     "sounds":  [
++                                                    {
++                                                        "name":  "minecraft:music/game/nether/warmth",
++                                                        "stream":  true
++                                                    }
++                                                ]
++                                 },
++    "music.game.nether.ballad_of_the_cats":  {
++                                                 "sounds":  [
++                                                                {
++                                                                    "name":  "minecraft:music/game/nether/ballad_of_the_cats",
++                                                                    "stream":  true
++                                                                }
++                                                            ]
++                                             },
++    "music.game.end.the_end":  {
++                                   "sounds":  [
++                                                  {
++                                                      "name":  "minecraft:music/game/end/the_end",
++                                                      "stream":  true
++                                                  }
++                                              ]
++                               },
++    "music.game.end.boss":  {
++                                "sounds":  [
++                                               {
++                                                   "name":  "minecraft:music/game/end/boss",
++                                                   "stream":  true
++                                               }
++                                           ]
++                            },
++    "music.game.end.alpha":  {
++                                 "sounds":  [
++                                                {
++                                                    "name":  "minecraft:music/game/end/alpha",
++                                                    "stream":  true
++                                                }
++                                            ]
++                             },
++    "music.game.water.axolotl":  {
++                                     "sounds":  [
++                                                    {
++                                                        "name":  "minecraft:music/game/water/axolotl",
++                                                        "stream":  true
++                                                    }
++                                                ]
++                                 },
++    "music.game.water.dragon_fish":  {
++                                         "sounds":  [
++                                                        {
++                                                            "name":  "minecraft:music/game/water/dragon_fish",
++                                                            "stream":  true
++                                                        }
++                                                    ]
++                                     },
++    "music.game.water.shuniji":  {
++                                     "sounds":  [
++                                                    {
++                                                        "name":  "minecraft:music/game/water/shuniji",
++                                                        "stream":  true
++                                                    }
++                                                ]
++                                 },
++    "music.menu.mutation":  {
++                                "sounds":  [
++                                               {
++                                                   "name":  "minecraft:music/menu/mutation",
++                                                   "stream":  true
++                                               }
++                                           ]
++                            },
++    "music.menu.moog_city_2":  {
++                                   "sounds":  [
++                                                  {
++                                                      "name":  "minecraft:music/menu/moog_city_2",
++                                                      "stream":  true
++                                                  }
++                                              ]
++                               },
++    "music.menu.beginning_2":  {
++                                   "sounds":  [
++                                                  {
++                                                      "name":  "minecraft:music/menu/beginning_2",
++                                                      "stream":  true
++                                                  }
++                                              ]
++                               },
++    "music.menu.floating_trees":  {
++                                      "sounds":  [
++                                                     {
++                                                         "name":  "minecraft:music/menu/floating_trees",
++                                                         "stream":  true
++                                                     }
++                                                 ]
++                                  }
++}
+\ No newline at end of file
+diff --git a/fabric/src/main/resources/skycraft.mixins.json b/fabric/src/main/resources/skycraft.mixins.json
+index 5ea8e5b..0096331 100644
+--- a/fabric/src/main/resources/skycraft.mixins.json
++++ b/fabric/src/main/resources/skycraft.mixins.json
+@@ -19,7 +19,15 @@
+     "ProjectileUtilMixin",
+     "ServerExplosionMixin",
+     "ServerPlayerMixin",
+-    "SmithingMixin"
++    "SmithingMixin",
++    "WalkNodeEvaluatorMixin",
++    "PlayerFallMixin",
++    "NearestAttackableTargetGoalAccessor",
++    "MobGoalsAccessor",
++    "SupportBlocksMixin",
++    "MobNoPlayerTargetMixin",
++    "WitherHeadsMixin",
++    "PlayerHostileDamageMixin"
+   ],
+   "injectors": { "defaultRequire": 1 }
+ }
+diff --git a/fabric/src/test/java/dev/skycraft/world/SkyRayTest.java b/fabric/src/test/java/dev/skycraft/world/SkyRayTest.java
+index cf18e5a..c2bf85e 100644
+--- a/fabric/src/test/java/dev/skycraft/world/SkyRayTest.java
++++ b/fabric/src/test/java/dev/skycraft/world/SkyRayTest.java
+@@ -73,6 +73,17 @@ class SkyRayTest {
+ 		assertArrayEquals(new int[] { 0, 11, 0 }, SkyRay.placementCell(high));
+ 	}
+ 
++	@Test
++	void placedBlockCanAlwaysBeJumpedOnto() {
++		// MarioCraft: whatever height the ground is at, the block's top is at most 1.25 above it.
++		for (double y = 10.0; y < 11.0; y += 0.05) {
++			SkyRay.Hit hit = SkyRay.cast(ground(y), 0.5, 13.0, 0.5, 0.5, 7.0, 0.5);
++			int[] cell = SkyRay.placementCell(hit);
++			double top = cell[1] + 1.0 - y;
++			assertEquals(true, top <= 1.25 + 1e-9 && top > 0.0, "ground " + y + ": top " + top);
++		}
++	}
++
+ 	@Test
+ 	void projectileSticksInTheSurfaceCell() {
+ 		SkyRay.Hit hit = SkyRay.cast(ground(10.0), 0.5, 12.0, 0.5, 0.5, 8.0, 0.5);

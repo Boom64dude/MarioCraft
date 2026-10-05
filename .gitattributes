@@ -1,0 +1,6 @@
+# Keep line endings as they are: bash needs install.sh with LF, git apply needs the patches byte
+# for byte, and cmd wants install.bat with CRLF (a Windows clone would otherwise convert them).
+*.sh     text eol=lf
+*.patch  -text
+*.bat    text eol=crlf
+*.webp   binary

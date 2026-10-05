@@ -1,0 +1,11 @@
+# Made by install.bat: never commit these (they hold the game data built from your ROM)
+*.z64
+*.n64
+*.v64
+sm64coopdx/
+SkyCraft/
+*.log
+MarioCraft Launcher.exe
+launcher/cache/
+launcher/prism-path.txt
+launcher/setup.log
